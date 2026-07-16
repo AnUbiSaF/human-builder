@@ -7,3 +7,5 @@ bin/
 *.jar
 *.log
 .DS_Store
+run/
+
