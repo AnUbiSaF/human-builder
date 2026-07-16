@@ -5,10 +5,7 @@ import com.humanbuilder.logic.BuildEntry;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.render.RenderLayer;
-import net.minecraft.client.render.VertexConsumer;
 import net.minecraft.client.render.VertexConsumerProvider;
-import net.minecraft.client.render.WorldRenderer;
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
@@ -24,7 +21,13 @@ import java.util.List;
 25:  */
 public class SchematicRenderer {
 
+    private static final int RENDER_RADIUS = 16;
+    private static final int MAX_RENDERED_BLOCKS = 768;
+    private static final long CACHE_INTERVAL_NANOS = 300_000_000L;
+
     private final BuildExecutor executor;
+    private List<BuildEntry> visibleCache = List.of();
+    private long nextCacheRefresh;
 
     public SchematicRenderer(BuildExecutor executor) {
         this.executor = executor;
@@ -39,13 +42,20 @@ public class SchematicRenderer {
 
     private void render(WorldRenderContext context) {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player == null || client.world == null || !executor.isActive()) {
+        if (client.player == null || client.world == null || !executor.isActive()
+                || !executor.isHologramVisible()) {
+            visibleCache = List.of();
             return;
         }
 
         Vec3d cameraPos = context.camera().getPos();
         BlockPos playerPos = client.player.getBlockPos();
-        List<BuildEntry> remaining = executor.getRemainingEntries();
+        long now = System.nanoTime();
+        if (now >= nextCacheRefresh) {
+            visibleCache = executor.getVisibleEntries(
+                    playerPos, RENDER_RADIUS, MAX_RENDERED_BLOCKS);
+            nextCacheRefresh = now + CACHE_INTERVAL_NANOS;
+        }
 
         MatrixStack matrices = context.matrixStack();
         VertexConsumerProvider consumers = context.consumers();
@@ -54,14 +64,8 @@ public class SchematicRenderer {
         }
 
         // Рендерим только блоки в радиусе 16 метров, чтобы не перегружать FPS
-        int renderDistanceSq = 16 * 16;
-
-        for (BuildEntry entry : remaining) {
+        for (BuildEntry entry : visibleCache) {
             BlockPos pos = entry.pos();
-            double distSq = pos.getSquaredDistance(playerPos);
-            if (distSq > renderDistanceSq) {
-                continue;
-            }
 
             // Выбираем цвет в зависимости от категории блока
             float r = 0.0f, g = 0.8f, b = 0.8f; // дефолтный бирюзовый

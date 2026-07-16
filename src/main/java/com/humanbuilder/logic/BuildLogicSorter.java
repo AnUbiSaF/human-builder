@@ -23,6 +23,30 @@ import java.util.*;
  */
 public class BuildLogicSorter {
 
+    /** Classifies blocks without running any route-ordering algorithm. */
+    public List<BuildEntry> categorize(Map<BlockPos, BlockState> blocks) {
+        if (blocks.isEmpty()) return Collections.emptyList();
+
+        int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
+        int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
+        int minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
+        for (BlockPos pos : blocks.keySet()) {
+            minX = Math.min(minX, pos.getX()); maxX = Math.max(maxX, pos.getX());
+            minY = Math.min(minY, pos.getY()); maxY = Math.max(maxY, pos.getY());
+            minZ = Math.min(minZ, pos.getZ()); maxZ = Math.max(maxZ, pos.getZ());
+        }
+
+        List<BuildEntry> result = new ArrayList<>(blocks.size());
+        for (var entry : blocks.entrySet()) {
+            result.add(new BuildEntry(
+                    entry.getKey(),
+                    entry.getValue(),
+                    classify(entry.getKey(), entry.getValue(), minX, maxX, minY, maxY, minZ, maxZ, blocks)
+            ));
+        }
+        return result;
+    }
+
     /**
      * Главный метод: сортирует блоки в порядке строительства.
      *
@@ -31,6 +55,10 @@ public class BuildLogicSorter {
      * @return упорядоченная очередь строительства
      */
     public List<BuildEntry> sort(Map<BlockPos, BlockState> blocks, BlockPos playerPos) {
+        return sort(blocks, playerPos, SortMode.LAYERED);
+    }
+
+    public List<BuildEntry> sort(Map<BlockPos, BlockState> blocks, BlockPos playerPos, SortMode mode) {
         if (blocks.isEmpty()) return Collections.emptyList();
 
         // ── 1. Находим bounding box ───────────────────────────────────
@@ -45,42 +73,199 @@ public class BuildLogicSorter {
         }
 
         // ── 2. Классифицируем каждый блок ─────────────────────────────
-        Map<BlockCategory, List<BuildEntry>> categorized = new EnumMap<>(BlockCategory.class);
-
+        List<BuildEntry> allEntries = new ArrayList<>();
+        NavigableMap<Integer, EnumMap<BlockCategory, List<BuildEntry>>> entriesByLayer = new TreeMap<>();
         for (var entry : blocks.entrySet()) {
             BlockPos pos = entry.getKey();
             BlockState state = entry.getValue();
             BlockCategory category = classify(pos, state, minX, maxX, minY, maxY, minZ, maxZ, blocks);
-
-            categorized.computeIfAbsent(category, k -> new ArrayList<>())
-                        .add(new BuildEntry(pos, state, category));
+            BuildEntry buildEntry = new BuildEntry(pos, state, category);
+            allEntries.add(buildEntry);
+            entriesByLayer
+                    .computeIfAbsent(pos.getY(), ignored -> new EnumMap<>(BlockCategory.class))
+                    .computeIfAbsent(category, ignored -> new ArrayList<>())
+                    .add(buildEntry);
         }
 
-        // ── 3. Сортируем внутри каждой категории ──────────────────────
         List<BuildEntry> result = new ArrayList<>();
         BlockPos currentPos = playerPos;
 
-        for (BlockCategory category : BlockCategory.values()) {
-            List<BuildEntry> entries = categorized.getOrDefault(category, Collections.emptyList());
-            if (entries.isEmpty()) continue;
+        if (mode == SortMode.DEFAULT) {
+            // Классический режим по категориям
+            Map<BlockCategory, List<BuildEntry>> categorized = new EnumMap<>(BlockCategory.class);
+            for (BuildEntry entry : allEntries) {
+                categorized.computeIfAbsent(entry.category(), k -> new ArrayList<>()).add(entry);
+            }
+            for (BlockCategory category : BlockCategory.values()) {
+                List<BuildEntry> entries = categorized.getOrDefault(category, Collections.emptyList());
+                if (entries.isEmpty()) continue;
 
-            // Для стен и фундамента — wall-following.
-            // Для остальных — nearest-neighbor по этажам.
-            List<BuildEntry> sorted;
-            if (category == BlockCategory.FOUNDATION || category == BlockCategory.WALL) {
-                sorted = wallFollowingSort(entries, currentPos);
-            } else {
-                sorted = layerByLayerSort(entries, currentPos);
+                List<BuildEntry> sorted;
+                if (category == BlockCategory.FOUNDATION || category == BlockCategory.WALL || category == BlockCategory.INTERIOR_WALL) {
+                    sorted = wallFollowingSort(entries, currentPos);
+                } else {
+                    sorted = layerByLayerSort(entries, currentPos);
+                }
+                result.addAll(sorted);
+                if (!sorted.isEmpty()) {
+                    currentPos = sorted.get(sorted.size() - 1).pos();
+                }
+            }
+        } else if (mode == SortMode.LAYERED) {
+            // Strict bottom-to-top order. Categories only affect ordering
+            // inside a layer and can never pull a block from a higher Y.
+            for (Map<BlockCategory, List<BuildEntry>> layer : entriesByLayer.values()) {
+                for (BlockCategory category : BlockCategory.values()) {
+                    List<BuildEntry> entries = layer.getOrDefault(category, Collections.emptyList());
+                    if (entries.isEmpty()) continue;
+
+                    List<BuildEntry> sorted;
+                    if (category == BlockCategory.FOUNDATION
+                            || category == BlockCategory.WALL
+                            || category == BlockCategory.INTERIOR_WALL) {
+                        sorted = wallFollowingSort(entries, currentPos);
+                    } else {
+                        sorted = nearestNeighborSort(entries, currentPos);
+                    }
+                    result.addAll(sorted);
+                    currentPos = sorted.get(sorted.size() - 1).pos();
+                }
+            }
+        } else {
+            // Смешанный режим по слоям (MIXED)
+            // ── PHASE 1: Первый слой полностью (Y = minY) ──
+            Map<BlockCategory, List<BuildEntry>> firstLayerCategorized = entriesByLayer.get(minY);
+            for (BlockCategory category : BlockCategory.values()) {
+                List<BuildEntry> entries = firstLayerCategorized.getOrDefault(category, Collections.emptyList());
+                if (entries.isEmpty()) continue;
+
+                List<BuildEntry> sorted;
+                if (category == BlockCategory.FOUNDATION || category == BlockCategory.WALL || category == BlockCategory.INTERIOR_WALL) {
+                    sorted = wallFollowingSort(entries, currentPos);
+                } else {
+                    sorted = layerByLayerSort(entries, currentPos);
+                }
+                result.addAll(sorted);
+                if (!sorted.isEmpty()) {
+                    currentPos = sorted.get(sorted.size() - 1).pos();
+                }
             }
 
-            result.addAll(sorted);
+            // Each next layer completes its structural run and filling before
+            // moving upward. The previous all-walls-then-all-filling order left
+            // MIXED waiting on unsupported upper sections and caused long scans.
+            for (Map<BlockCategory, List<BuildEntry>> layer
+                    : entriesByLayer.tailMap(minY, false).values()) {
+                List<BuildEntry> layerWalls = new ArrayList<>();
+                for (BlockCategory category : List.of(
+                        BlockCategory.FOUNDATION, BlockCategory.WALL, BlockCategory.INTERIOR_WALL)) {
+                    layerWalls.addAll(layer.getOrDefault(category, Collections.emptyList()));
+                }
+                if (!layerWalls.isEmpty()) {
+                    List<BuildEntry> sorted = wallFollowingSort(layerWalls, currentPos);
+                    result.addAll(sorted);
+                    if (!sorted.isEmpty()) {
+                        currentPos = sorted.get(sorted.size() - 1).pos();
+                    }
+                }
 
-            if (!sorted.isEmpty()) {
-                currentPos = sorted.get(sorted.size() - 1).pos();
+                for (BlockCategory category : BlockCategory.values()) {
+                    if (category == BlockCategory.FOUNDATION || category == BlockCategory.WALL
+                            || category == BlockCategory.INTERIOR_WALL) continue;
+                    List<BuildEntry> entries = layer.getOrDefault(category, Collections.emptyList());
+                    if (entries.isEmpty()) continue;
+
+                    List<BuildEntry> sorted = layerByLayerSort(entries, currentPos);
+                    result.addAll(sorted);
+                    if (!sorted.isEmpty()) {
+                        currentPos = sorted.get(sorted.size() - 1).pos();
+                    }
+                }
             }
         }
 
+        return batchAdjacentSameBlocks(result, playerPos);
+    }
+
+    /**
+     * Keeps each horizontally connected group of the same block together.
+     * Less exposed cells are placed first so the outer edge does not hide the
+     * remaining cells of a dense floor or wall from the player.
+     */
+    private List<BuildEntry> batchAdjacentSameBlocks(List<BuildEntry> ordered, BlockPos start) {
+        if (ordered.size() < 2) return ordered;
+
+        Map<BlockPos, BuildEntry> byPos = new HashMap<>();
+        for (BuildEntry entry : ordered) byPos.put(entry.pos(), entry);
+
+        Set<BlockPos> remaining = new HashSet<>(byPos.keySet());
+        List<BuildEntry> batched = new ArrayList<>(ordered.size());
+        BlockPos current = start;
+
+        for (BuildEntry seed : ordered) {
+            if (!remaining.contains(seed.pos())) continue;
+
+            Set<BlockPos> component = collectSameBlockComponent(seed, byPos, remaining);
+            List<BuildEntry> safeOrder = orderComponentInsideOut(component, byPos, current);
+            batched.addAll(safeOrder);
+            remaining.removeAll(component);
+            if (!safeOrder.isEmpty()) current = safeOrder.get(safeOrder.size() - 1).pos();
+        }
+        return batched;
+    }
+
+    private Set<BlockPos> collectSameBlockComponent(BuildEntry seed, Map<BlockPos, BuildEntry> byPos,
+                                                     Set<BlockPos> remaining) {
+        Set<BlockPos> component = new HashSet<>();
+        ArrayDeque<BlockPos> open = new ArrayDeque<>();
+        open.add(seed.pos());
+
+        while (!open.isEmpty()) {
+            BlockPos pos = open.removeFirst();
+            if (!remaining.contains(pos) || !component.add(pos)) continue;
+
+            for (BlockPos neighbor : horizontalNeighbors(pos)) {
+                BuildEntry candidate = byPos.get(neighbor);
+                if (candidate != null
+                        && candidate.pos().getY() == seed.pos().getY()
+                        && candidate.state().getBlock() == seed.state().getBlock()) {
+                    open.addLast(neighbor);
+                }
+            }
+        }
+        return component;
+    }
+
+    private List<BuildEntry> orderComponentInsideOut(Set<BlockPos> component,
+                                                      Map<BlockPos, BuildEntry> allEntries,
+                                                      BlockPos start) {
+        Map<Integer, List<BuildEntry>> byExposure = new TreeMap<>();
+        for (BlockPos pos : component) {
+            byExposure
+                    .computeIfAbsent(exposedSideCount(pos, allEntries), ignored -> new ArrayList<>())
+                    .add(allEntries.get(pos));
+        }
+
+        List<BuildEntry> result = new ArrayList<>(component.size());
+        BlockPos cursor = start;
+        for (List<BuildEntry> exposureBand : byExposure.values()) {
+            List<BuildEntry> swept = spatialSweepSort(exposureBand, cursor);
+            result.addAll(swept);
+            if (!swept.isEmpty()) cursor = swept.get(swept.size() - 1).pos();
+        }
         return result;
+    }
+
+    private int exposedSideCount(BlockPos pos, Map<BlockPos, BuildEntry> allEntries) {
+        int exposed = 0;
+        for (BlockPos neighbor : horizontalNeighbors(pos)) {
+            if (!allEntries.containsKey(neighbor)) exposed++;
+        }
+        return exposed;
+    }
+
+    private BlockPos[] horizontalNeighbors(BlockPos pos) {
+        return new BlockPos[]{pos.east(), pos.west(), pos.south(), pos.north()};
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -180,35 +365,7 @@ public class BuildLogicSorter {
      * 4. Если соседей нет — прыгаем к ближайшему неиспользованному.
      */
     private List<BuildEntry> wallFollowingSort(List<BuildEntry> entries, BlockPos start) {
-        List<BuildEntry> sorted = new ArrayList<>(entries.size());
-        Set<BlockPos> remaining = new LinkedHashSet<>();
-        Map<BlockPos, BuildEntry> lookup = new HashMap<>();
-
-        for (BuildEntry e : entries) {
-            remaining.add(e.pos());
-            lookup.put(e.pos(), e);
-        }
-
-        BlockPos current = start;
-
-        while (!remaining.isEmpty()) {
-            // Найти ближайший из оставшихся
-            BlockPos nearest = findNearest(current, remaining);
-            if (nearest == null) break;
-
-            // «Вести» линию от этого блока
-            BlockPos linePos = nearest;
-            while (linePos != null && remaining.contains(linePos)) {
-                remaining.remove(linePos);
-                sorted.add(lookup.get(linePos));
-                current = linePos;
-
-                // Ищем соседа по линии (предпочитаем то же направление)
-                linePos = findWallNeighbor(linePos, remaining);
-            }
-        }
-
-        return sorted;
+        return spatialSweepSort(entries, start);
     }
 
     /**
@@ -264,28 +421,74 @@ public class BuildLogicSorter {
      * Простая Nearest-Neighbor сортировка (жадный алгоритм).
      */
     private List<BuildEntry> nearestNeighborSort(List<BuildEntry> entries, BlockPos start) {
-        List<BuildEntry> sorted = new ArrayList<>(entries.size());
-        List<BuildEntry> pool = new ArrayList<>(entries);
-        BlockPos current = start;
+        return spatialSweepSort(entries, start);
+    }
 
-        while (!pool.isEmpty()) {
-            int bestIdx = 0;
-            double bestDist = Double.MAX_VALUE;
+    /**
+     * Orders each layer in alternating rows. This preserves short, continuous
+     * build runs without the O(n^2) nearest-neighbour search used previously.
+     */
+    private List<BuildEntry> spatialSweepSort(List<BuildEntry> entries, BlockPos start) {
+        if (entries.size() < 2) return new ArrayList<>(entries);
 
-            for (int i = 0; i < pool.size(); i++) {
-                double dist = pool.get(i).squaredDistance(current);
-                if (dist < bestDist) {
-                    bestDist = dist;
-                    bestIdx = i;
-                }
-            }
-
-            BuildEntry chosen = pool.remove(bestIdx);
-            sorted.add(chosen);
-            current = chosen.pos();
+        Map<Integer, List<BuildEntry>> layers = new TreeMap<>();
+        for (BuildEntry entry : entries) {
+            layers.computeIfAbsent(entry.pos().getY(), ignored -> new ArrayList<>()).add(entry);
         }
 
-        return sorted;
+        List<BuildEntry> result = new ArrayList<>(entries.size());
+        BlockPos cursor = start;
+        for (List<BuildEntry> layer : layers.values()) {
+            List<BuildEntry> swept = sweepLayer(layer, cursor);
+            result.addAll(swept);
+            if (!swept.isEmpty()) cursor = swept.get(swept.size() - 1).pos();
+        }
+        return result;
+    }
+
+    private List<BuildEntry> sweepLayer(List<BuildEntry> layer, BlockPos start) {
+        int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
+        int minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
+        for (BuildEntry entry : layer) {
+            minX = Math.min(minX, entry.pos().getX());
+            maxX = Math.max(maxX, entry.pos().getX());
+            minZ = Math.min(minZ, entry.pos().getZ());
+            maxZ = Math.max(maxZ, entry.pos().getZ());
+        }
+
+        boolean rowsAlongX = maxX - minX >= maxZ - minZ;
+        Map<Integer, List<BuildEntry>> rows = new TreeMap<>();
+        for (BuildEntry entry : layer) {
+            int row = rowsAlongX ? entry.pos().getZ() : entry.pos().getX();
+            rows.computeIfAbsent(row, ignored -> new ArrayList<>()).add(entry);
+        }
+
+        List<Integer> rowOrder = new ArrayList<>(rows.keySet());
+        int startRow = rowsAlongX ? start.getZ() : start.getX();
+        if (Math.abs(startRow - rowOrder.get(rowOrder.size() - 1))
+                < Math.abs(startRow - rowOrder.get(0))) {
+            Collections.reverse(rowOrder);
+        }
+
+        int startAlong = rowsAlongX ? start.getX() : start.getZ();
+        int minAlong = rowsAlongX ? minX : minZ;
+        int maxAlong = rowsAlongX ? maxX : maxZ;
+        boolean ascending = Math.abs(startAlong - minAlong) <= Math.abs(startAlong - maxAlong);
+        Comparator<BuildEntry> alongComparator = rowsAlongX
+                ? Comparator.comparingInt((BuildEntry entry) -> entry.pos().getX())
+                    .thenComparingInt(entry -> entry.pos().getZ())
+                : Comparator.comparingInt((BuildEntry entry) -> entry.pos().getZ())
+                    .thenComparingInt(entry -> entry.pos().getX());
+
+        List<BuildEntry> result = new ArrayList<>(layer.size());
+        for (int row : rowOrder) {
+            List<BuildEntry> entries = rows.get(row);
+            entries.sort(alongComparator);
+            if (!ascending) Collections.reverse(entries);
+            result.addAll(entries);
+            ascending = !ascending;
+        }
+        return result;
     }
 
     /**

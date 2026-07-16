@@ -4,7 +4,7 @@ package com.humanbuilder.executor;
  * Состояния стейт-машины BuildExecutor.
  *
  * Основной цикл:
- *   IDLE → SORTING → WALKING → LOOKING → PLACING → WAITING → (следующий блок) → WALKING
+ *   IDLE → PREVIEW → SORTING → WALKING → LOOKING → PLACING → WAITING → (следующий блок) → WALKING
  *
  * Ответвления:
  *   WALKING → SCAFFOLDING (если нужно подняться)
@@ -16,11 +16,17 @@ public enum BuildState {
     /** Ничего не происходит — ожидание команды */
     IDLE,
 
+    /** Схема загружена, голограмма отображается — позиционирование палкой */
+    PREVIEW,
+
     /** Схема загружена, сортируем блоки в очередь */
     SORTING,
 
     /** Идём к позиции для установки следующего блока */
     WALKING,
+
+    /** Подходим и ломаем блок, мешающий целевой позиции или лучу установки. */
+    BREAKING,
 
     /** Остановились — плавно наводим прицел на блок */
     LOOKING,
@@ -35,5 +41,8 @@ public enum BuildState {
     SCAFFOLDING,
 
     /** Имитация ошибки: ставим не тот блок, ломаем, исправляем */
-    MISTAKE
+    MISTAKE,
+
+    /** Строительство временно приостановлено пользователем */
+    PAUSED
 }

@@ -2,7 +2,10 @@ package com.humanbuilder.command;
 
 import com.humanbuilder.HumanBuilderMod;
 import com.humanbuilder.executor.BuildExecutor;
+import com.humanbuilder.executor.BuildState;
+import com.humanbuilder.gui.HumanBuilderScreen;
 import com.humanbuilder.parser.SchematicParser;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -13,16 +16,20 @@ import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
 
 import java.io.File;
-import java.util.HashMap;
 import java.util.Map;
 
 /**
  * Команда чата для управления строительством.
  *
  * Использование:
- *   /humanbuilder build <файл.litematic>  — начать строительство
- *   /humanbuilder stop                    — остановить строительство
- *   /humanbuilder status                  — показать прогресс
+ *   /humanbuilder view <файл.litematic>   — загрузить голограмму для настройки позиции
+ *   /humanbuilder start                    — начать строительство из текущей позиции голограммы
+ *   /humanbuilder build <файл.litematic>   — быстрый старт (загрузить + сразу строить)
+ *   /humanbuilder stop                     — остановить строительство
+ *   /humanbuilder pause                    — приостановить
+ *   /humanbuilder resume                   — возобновить
+ *   /humanbuilder move <dx> <dy> <dz>      — сдвинуть голограмму
+ *   /humanbuilder status                   — показать прогресс
  *
  * Путь к файлу ищется относительно папки schematics/ в .minecraft,
  * или принимается абсолютный путь.
@@ -40,7 +47,20 @@ public class BuildCommand {
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
             dispatcher.register(
                 ClientCommandManager.literal("humanbuilder")
-                    // /humanbuilder build <filename>
+                    // /humanbuilder view <filename> — загрузить превью голограммы
+                    .then(ClientCommandManager.literal("view")
+                        .then(ClientCommandManager.argument("file", StringArgumentType.greedyString())
+                            .executes(ctx -> executeView(
+                                ctx.getSource(),
+                                StringArgumentType.getString(ctx, "file")
+                            ))
+                        )
+                    )
+                    // /humanbuilder start — запустить строительство из текущей позиции голограммы
+                    .then(ClientCommandManager.literal("start")
+                        .executes(ctx -> executeStart(ctx.getSource()))
+                    )
+                    // /humanbuilder build <filename> — быстрый старт
                     .then(ClientCommandManager.literal("build")
                         .then(ClientCommandManager.argument("file", StringArgumentType.greedyString())
                             .executes(ctx -> executeBuild(
@@ -52,6 +72,67 @@ public class BuildCommand {
                     // /humanbuilder stop
                     .then(ClientCommandManager.literal("stop")
                         .executes(ctx -> executeStop(ctx.getSource()))
+                    )
+                    // /humanbuilder pause
+                    .then(ClientCommandManager.literal("pause")
+                        .executes(ctx -> {
+                            executor.pauseBuild();
+                            return 1;
+                        })
+                    )
+                    // /humanbuilder resume
+                    .then(ClientCommandManager.literal("resume")
+                        .executes(ctx -> {
+                            executor.resumeBuild();
+                            return 1;
+                        })
+                    )
+                    .then(ClientCommandManager.literal("gui")
+                        .executes(ctx -> {
+                            MinecraftClient client = MinecraftClient.getInstance();
+                            client.setScreen(new HumanBuilderScreen(executor));
+                            return 1;
+                        })
+                    )
+                    // /humanbuilder move <dx> <dy> <dz>
+                    .then(ClientCommandManager.literal("move")
+                        .then(ClientCommandManager.argument("dx", IntegerArgumentType.integer())
+                            .then(ClientCommandManager.argument("dy", IntegerArgumentType.integer())
+                                .then(ClientCommandManager.argument("dz", IntegerArgumentType.integer())
+                                    .executes(ctx -> {
+                                        int dx = IntegerArgumentType.getInteger(ctx, "dx");
+                                        int dy = IntegerArgumentType.getInteger(ctx, "dy");
+                                        int dz = IntegerArgumentType.getInteger(ctx, "dz");
+                                        executor.moveSchematic(dx, dy, dz);
+                                        return 1;
+                                    })
+                                )
+                            )
+                        )
+                    )
+                    // /humanbuilder mode [default|mixed|layered]
+                    .then(ClientCommandManager.literal("mode")
+                        .then(ClientCommandManager.literal("default")
+                            .executes(ctx -> {
+                                executor.setSortMode(com.humanbuilder.logic.SortMode.DEFAULT);
+                                ctx.getSource().sendFeedback(Text.literal("§a[HB] Режим сортировки изменен на классический: §eDEFAULT"));
+                                return 1;
+                            })
+                        )
+                        .then(ClientCommandManager.literal("mixed")
+                            .executes(ctx -> {
+                                executor.setSortMode(com.humanbuilder.logic.SortMode.MIXED);
+                                ctx.getSource().sendFeedback(Text.literal("§a[HB] Режим сортировки изменен на послойный: §eMIXED"));
+                                return 1;
+                            })
+                        )
+                        .then(ClientCommandManager.literal("layered")
+                            .executes(ctx -> {
+                                executor.setSortMode(com.humanbuilder.logic.SortMode.LAYERED);
+                                ctx.getSource().sendFeedback(Text.literal("§a[HB] Режим сортировки: §eстрого по слоям снизу вверх"));
+                                return 1;
+                            })
+                        )
                     )
                     // /humanbuilder status
                     .then(ClientCommandManager.literal("status")
@@ -65,6 +146,71 @@ public class BuildCommand {
     //  Обработчики команд
     // ════════════════════════════════════════════════════════════════════
 
+    /**
+     * /humanbuilder view <file> — загрузить голограмму для настройки позиции.
+     */
+    private static int executeView(FabricClientCommandSource source, String filename) {
+        if (executor.isActive()) {
+            source.sendFeedback(Text.literal("§c[HB] Сначала остановите текущий процесс: /humanbuilder stop"));
+            return 0;
+        }
+
+        MinecraftClient client = MinecraftClient.getInstance();
+
+        // ── Поиск файла ──────────────────────────────────────────────
+        File schematicFile = resolveSchematicFile(filename);
+        if (schematicFile == null || !schematicFile.exists()) {
+            source.sendFeedback(Text.literal("§c[HB] Файл не найден: " + filename));
+            source.sendFeedback(Text.literal("§7    Путь: " + getSchematicsDir().getAbsolutePath()));
+            return 0;
+        }
+
+        source.sendFeedback(Text.literal("§a[HB] Загрузка превью: §e" + schematicFile.getName() + "§a..."));
+
+        try {
+            SchematicParser parser = new SchematicParser();
+            Map<BlockPos, BlockState> blocks = parser.parse(schematicFile);
+
+            if (blocks.isEmpty()) {
+                source.sendFeedback(Text.literal("§c[HB] Схема пуста или не содержит блоков."));
+                return 0;
+            }
+
+            // Загружаем голограмму в режиме превью
+            executor.loadSchematic(blocks);
+
+        } catch (Exception e) {
+            source.sendFeedback(Text.literal("§c[HB] Ошибка парсинга: " + e.getMessage()));
+            HumanBuilderMod.LOGGER.error("Ошибка парсинга схемы", e);
+            return 0;
+        }
+
+        return 1;
+    }
+
+    /**
+     * /humanbuilder start — запустить строительство из текущей позиции голограммы.
+     */
+    private static int executeStart(FabricClientCommandSource source) {
+        if (executor.getState() != BuildState.PREVIEW) {
+            source.sendFeedback(Text.literal("§c[HB] Сначала загрузите голограмму: /humanbuilder view <файл>"));
+            return 0;
+        }
+
+        // ── Проверка Creative Mode ───────────────────────────────────
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player != null && !client.player.getAbilities().creativeMode) {
+            source.sendFeedback(Text.literal("§c[HB] Ошибка: HumanBuilder работает только в Creative Mode!"));
+            return 0;
+        }
+
+        executor.startBuild();
+        return 1;
+    }
+
+    /**
+     * /humanbuilder build <file> — быстрый старт (загрузка + сразу строительство).
+     */
     private static int executeBuild(FabricClientCommandSource source, String filename) {
         if (executor.isActive()) {
             source.sendFeedback(Text.literal("§c[HB] Строительство уже идёт! Используйте /humanbuilder stop"));
@@ -88,8 +234,6 @@ public class BuildCommand {
 
         source.sendFeedback(Text.literal("§a[HB] Загрузка: §e" + schematicFile.getName() + "§a..."));
 
-        // ── Парсинг в отдельном потоке (чтобы не фризить клиент) ─────
-        // Для маленьких схем это мгновенно, но для больших — важно.
         try {
             SchematicParser parser = new SchematicParser();
             Map<BlockPos, BlockState> blocks = parser.parse(schematicFile);
@@ -99,30 +243,10 @@ public class BuildCommand {
                 return 0;
             }
 
-            // Находим нижний ближний угол схемы (минимальные координаты)
-            int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
-            for (BlockPos pos : blocks.keySet()) {
-                if (pos.getX() < minX) minX = pos.getX();
-                if (pos.getY() < minY) minY = pos.getY();
-                if (pos.getZ() < minZ) minZ = pos.getZ();
-            }
+            source.sendFeedback(Text.literal("§a[HB] Загружено §e" + blocks.size() + "§a блоков. Начинаю строительство..."));
 
-            // Смещаем схему перед игроком (на 3 блока вперед по горизонтали), чтобы игрок не мешал установке первого блока своим телом
-            BlockPos playerPos = client.player != null ? client.player.getBlockPos() : BlockPos.ORIGIN;
-            net.minecraft.util.math.Direction facing = client.player != null ? client.player.getHorizontalFacing() : net.minecraft.util.math.Direction.NORTH;
-            BlockPos buildOrigin = playerPos.offset(facing, 3);
-
-            Map<BlockPos, BlockState> offsetBlocks = new HashMap<>();
-            for (var entry : blocks.entrySet()) {
-                BlockPos relPos = entry.getKey();
-                BlockPos absPos = relPos.add(buildOrigin.getX() - minX, buildOrigin.getY() - minY, buildOrigin.getZ() - minZ);
-                offsetBlocks.put(absPos, entry.getValue());
-            }
-
-            source.sendFeedback(Text.literal("§a[HB] Загружено §e" + blocks.size() + "§a блоков. Схема привязана к вашим координатам. Начинаю строительство..."));
-
-            // Запускаем строительство
-            executor.startBuild(offsetBlocks);
+            // Запускаем строительство (быстрый старт)
+            executor.startBuild(blocks);
 
         } catch (Exception e) {
             source.sendFeedback(Text.literal("§c[HB] Ошибка парсинга: " + e.getMessage()));
@@ -144,9 +268,20 @@ public class BuildCommand {
     }
 
     private static int executeStatus(FabricClientCommandSource source) {
-        if (!executor.isActive()) {
+        BuildState currentState = executor.getState();
+
+        if (currentState == BuildState.IDLE) {
             source.sendFeedback(Text.literal("§e[HB] Строительство не запущено."));
             return 0;
+        }
+
+        if (currentState == BuildState.PREVIEW) {
+            source.sendFeedback(Text.literal(
+                "§a[HB] Статус: §eПРЕВЬЮ"
+                + "§r | Блоков в схеме: §e" + executor.getTotalBlocks()
+                + "§r | Палка: §e" + (executor.isStickMoveMode() ? "АКТИВНА" : "зафиксирована")
+            ));
+            return 1;
         }
 
         int placed = executor.getBlocksPlaced();
@@ -154,8 +289,9 @@ public class BuildCommand {
         int percent = total > 0 ? (placed * 100 / total) : 0;
 
         source.sendFeedback(Text.literal(
-            "§a[HB] Статус: §e" + executor.getState().name()
+            "§a[HB] Статус: §e" + currentState.name()
             + "§r | Прогресс: §e" + percent + "%§r (" + placed + "/" + total + ")"
+            + "§r | Режим: §e" + executor.getSortMode().name()
         ));
 
         return 1;
@@ -173,7 +309,7 @@ public class BuildCommand {
      * 2. Относительно .minecraft/schematics/
      * 3. Относительно .minecraft/config/litematica/
      */
-    private static File resolveSchematicFile(String filename) {
+    public static File resolveSchematicFile(String filename) {
         // Абсолютный путь
         File absolute = new File(filename);
         if (absolute.isAbsolute() && absolute.exists()) {
@@ -206,7 +342,7 @@ public class BuildCommand {
     /**
      * Папка schematics в .minecraft (создаёт, если не существует).
      */
-    private static File getSchematicsDir() {
+    public static File getSchematicsDir() {
         File gameDir = MinecraftClient.getInstance().runDirectory;
         File schematics = new File(gameDir, "schematics");
         if (!schematics.exists()) {
