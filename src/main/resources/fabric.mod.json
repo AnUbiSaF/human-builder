@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "human-builder",
+  "version": "${version}",
+  "name": "HumanBuilder",
+  "description": "Realistic automated building — builds structures like a real player",
+  "authors": ["HumanBuilder"],
+  "contact": {},
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.humanbuilder.HumanBuilderMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}

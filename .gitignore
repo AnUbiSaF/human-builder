@@ -1,0 +1,9 @@
+.gradle/
+build/
+.fabric/
+out/
+bin/
+*.class
+*.jar
+*.log
+.DS_Store
