@@ -46,6 +46,10 @@ public class HumanBuilderMod implements ClientModInitializer {
         movement = new MovementController(client, camera);
         executor = new BuildExecutor(client, camera, movement, placer, timing);
 
+        // ── Рендерер голограммы ──────────────────────────────────────
+        com.humanbuilder.renderer.SchematicRenderer renderer = new com.humanbuilder.renderer.SchematicRenderer(executor);
+        renderer.register();
+
         // ── Обработчик тиков ─────────────────────────────────────────
         tickHandler = new TickHandler(camera, movement, executor);
 

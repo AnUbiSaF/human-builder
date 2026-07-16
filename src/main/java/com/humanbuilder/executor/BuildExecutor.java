@@ -141,6 +141,21 @@ public class BuildExecutor {
     public int getTotalBlocks()  { return totalBlocks; }
     public boolean isActive()    { return state != BuildState.IDLE; }
 
+    /**
+     * Возвращает список всех оставшихся блоков схемы в очереди.
+     */
+    public List<BuildEntry> getRemainingEntries() {
+        List<BuildEntry> list = new ArrayList<>();
+        if (state == BuildState.IDLE) {
+            return list;
+        }
+        if (currentEntry != null) {
+            list.add(currentEntry);
+        }
+        list.addAll(buildQueue);
+        return list;
+    }
+
     // ════════════════════════════════════════════════════════════════════
     //  Обработчики состояний
     // ════════════════════════════════════════════════════════════════════

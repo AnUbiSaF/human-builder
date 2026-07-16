@@ -86,8 +86,39 @@ public class MovementController {
 
         // ── Проверяем, пришли ли ──────────────────────────────────────
         if (horizontalDist < ARRIVAL_THRESHOLD && isWithinReach(targetPos)) {
+            if (player.getAbilities().creativeMode && player.getAbilities().flying) {
+                player.getAbilities().flying = false;
+                player.sendAbilitiesUpdate();
+            }
             stop();
             return;
+        }
+
+        // ── Адаптивный креативный полет ──────────────────────────────
+        double dy = targetVec.y - playerPos.y;
+        boolean needsFlight = false;
+
+        // Если цель существенно выше ног игрока (1.5+ блоков) или ниже (2.5+ блоков)
+        if (dy > 1.5 || dy < -2.5) {
+            needsFlight = true;
+        }
+        // Если застряли во время ходьбы на 30+ тиков (1.5 секунды)
+        if (stuckTicks > 30) {
+            needsFlight = true;
+        }
+
+        if (player.getAbilities().creativeMode) {
+            boolean isFlying = player.getAbilities().flying;
+            if (needsFlight && !isFlying) {
+                player.getAbilities().flying = true;
+                player.sendAbilitiesUpdate();
+            } else if (!needsFlight && isFlying) {
+                // Выключаем полет, если вернулись на целевую высоту
+                if (player.isOnGround() || Math.abs(dy) <= 1.0) {
+                    player.getAbilities().flying = false;
+                    player.sendAbilitiesUpdate();
+                }
+            }
         }
 
         // ── Направляем камеру в сторону движения (только если мы не вплотную) ──
@@ -112,15 +143,27 @@ public class MovementController {
 
         releaseAllKeys();
 
-        // Идём вперёд только когда смотрим примерно на цель (угол < 40°)
-        // Это предотвращает спиральное кружение вокруг цели и обеспечивает плавность хода
         if (Math.abs(deltaYaw) < 40) {
             client.options.forwardKey.setPressed(true);
+
+            // Автоматический спринт при беге на ногах
+            if (!player.getAbilities().flying) {
+                player.setSprinting(true);
+            }
         }
 
-        // ── Прыжок, только если упёрлись в препятствие при движении ──
-        if (player.horizontalCollision && player.isOnGround()) {
-            client.options.jumpKey.setPressed(true);
+        // ── Управление высотой при полете ─────────────────────────────
+        if (player.getAbilities().flying) {
+            if (dy > 0.5) {
+                client.options.jumpKey.setPressed(true); // лететь вверх
+            } else if (dy < -0.5) {
+                client.options.sneakKey.setPressed(true); // лететь вниз
+            }
+        } else {
+            // Обычный авто-прыжок на земле
+            if (player.horizontalCollision && player.isOnGround()) {
+                client.options.jumpKey.setPressed(true);
+            }
         }
 
         // ── Детекция застревания ──────────────────────────────────────
@@ -128,10 +171,6 @@ public class MovementController {
             double moved = playerPos.squaredDistanceTo(lastPos);
             if (moved < 0.01) {
                 stuckTicks += 10;
-                if (stuckTicks > 40 && player.isOnGround()) {
-                    // Попробовать прыгнуть, если застряли
-                    client.options.jumpKey.setPressed(true);
-                }
             } else {
                 stuckTicks = 0;
             }
@@ -187,5 +226,6 @@ public class MovementController {
         client.options.leftKey.setPressed(false);
         client.options.rightKey.setPressed(false);
         client.options.jumpKey.setPressed(false);
+        client.options.sneakKey.setPressed(false);
     }
 }

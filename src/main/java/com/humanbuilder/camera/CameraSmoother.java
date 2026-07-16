@@ -109,16 +109,16 @@ public class CameraSmoother {
 
 
         // ── Линейная интерполяция (LERP) с ограничением скорости ───────
-        // Коэффициент LERP = 0.35f (35% расстояния преодолеваем за один тик)
-        float lerpFactor = 0.35f;
+        // Коэффициент LERP = 0.65f (65% расстояния преодолеваем за один тик)
+        float lerpFactor = 0.65f;
 
         float deltaYaw = yawError * lerpFactor;
         float deltaPitch = pitchError * lerpFactor;
 
         // Ограничиваем максимальную скорость поворота за один тик (1 тик = 50 мс)
-        // 20 градусов за тик = 400 градусов в секунду (человеческая скорость)
-        float maxSpeedYaw = 20.0f;
-        float maxSpeedPitch = 15.0f;
+        // 35 градусов за тик = 700 градусов в секунду (быстрое наведение)
+        float maxSpeedYaw = 35.0f;
+        float maxSpeedPitch = 25.0f;
 
         deltaYaw = MathHelper.clamp(deltaYaw, -maxSpeedYaw, maxSpeedYaw);
         deltaPitch = MathHelper.clamp(deltaPitch, -maxSpeedPitch, maxSpeedPitch);
