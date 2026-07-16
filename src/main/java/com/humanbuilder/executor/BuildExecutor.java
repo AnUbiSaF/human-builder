@@ -1162,7 +1162,7 @@ public class BuildExecutor {
             BuildEntry candidate = pendingEntries.get(pos);
             if (candidate == null
                     || candidate.pos().getY() != seed.pos().getY()
-                    || candidate.state().getBlock() != seed.state().getBlock()
+                    || !placer.canBatchPlacementStates(candidate.state(), seed.state())
                     || !activeBatch.add(pos)) continue;
             open.addLast(pos.east());
             open.addLast(pos.west());

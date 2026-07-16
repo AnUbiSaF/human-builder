@@ -1,6 +1,7 @@
 package com.humanbuilder.logic;
 
 import net.minecraft.block.*;
+import net.minecraft.state.property.Properties;
 import net.minecraft.util.math.BlockPos;
 
 import java.util.*;
@@ -90,7 +91,9 @@ public class BuildLogicSorter {
         List<BuildEntry> result = new ArrayList<>();
         BlockPos currentPos = playerPos;
 
-        if (mode == SortMode.DEFAULT) {
+        if (mode == SortMode.REALISTIC) {
+            return realisticConstructionSort(allEntries, playerPos);
+        } else if (mode == SortMode.DEFAULT) {
             // Классический режим по категориям
             Map<BlockCategory, List<BuildEntry>> categorized = new EnumMap<>(BlockCategory.class);
             for (BuildEntry entry : allEntries) {
@@ -188,7 +191,217 @@ public class BuildLogicSorter {
     }
 
     /**
-     * Keeps each horizontally connected group of the same block together.
+     * Plans construction as support-aware work runs instead of a flat list.
+     * A complete lower course unlocks the run above it, structural blocks
+     * unlock stairs/slabs and the finished shell unlocks attached decoration.
+     */
+    private List<BuildEntry> realisticConstructionSort(List<BuildEntry> entries, BlockPos start) {
+        Map<BlockPos, BuildEntry> entriesByPos = new HashMap<>();
+        for (BuildEntry entry : entries) entriesByPos.put(entry.pos(), entry);
+
+        List<ConstructionRun> runs = collectConstructionRuns(entries, entriesByPos, start);
+        Map<BlockPos, Integer> runByPos = new HashMap<>();
+        for (ConstructionRun run : runs) {
+            for (BuildEntry entry : run.entries) runByPos.put(entry.pos(), run.id);
+        }
+
+        for (ConstructionRun run : runs) {
+            for (BuildEntry entry : run.entries) {
+                addDependencyAt(run, entry.pos().down(), runByPos);
+
+                // Partial and attached blocks are scheduled only after all
+                // neighboring structural runs that can serve as support.
+                if (run.phase >= 2) {
+                    for (BlockPos neighbor : horizontalNeighbors(entry.pos())) {
+                        Integer neighborId = runByPos.get(neighbor);
+                        if (neighborId != null && neighborId != run.id
+                                && runs.get(neighborId).phase < run.phase) {
+                            run.dependencies.add(neighborId);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (ConstructionRun run : runs) {
+            run.remainingDependencies = run.dependencies.size();
+            for (int dependency : run.dependencies) {
+                runs.get(dependency).dependents.add(run.id);
+            }
+        }
+
+        Comparator<ConstructionRun> priority = Comparator
+                .comparingInt((ConstructionRun run) -> run.phase)
+                .thenComparingInt(run -> run.y)
+                .thenComparingInt(run -> run.category.getPriority())
+                .thenComparingDouble(run -> run.startDistance)
+                .thenComparingInt(run -> run.anchor.getX())
+                .thenComparingInt(run -> run.anchor.getZ());
+        PriorityQueue<ConstructionRun> ready = new PriorityQueue<>(priority);
+        for (ConstructionRun run : runs) {
+            if (run.remainingDependencies == 0) ready.offer(run);
+        }
+
+        List<BuildEntry> result = new ArrayList<>(entries.size());
+        BlockPos cursor = start;
+        while (!ready.isEmpty()) {
+            ConstructionRun run = ready.poll();
+            if (run.scheduled) continue;
+
+            List<BuildEntry> ordered = orderConstructionRun(run, entriesByPos, cursor);
+            result.addAll(ordered);
+            if (!ordered.isEmpty()) cursor = ordered.get(ordered.size() - 1).pos();
+            run.scheduled = true;
+
+            for (int dependentId : run.dependents) {
+                ConstructionRun dependent = runs.get(dependentId);
+                dependent.remainingDependencies--;
+                if (dependent.remainingDependencies == 0) ready.offer(dependent);
+            }
+        }
+
+        // Dependencies only point down or to an earlier phase, so a cycle is
+        // not expected. Keep a deterministic fallback for malformed schemes.
+        if (result.size() < entries.size()) {
+            List<ConstructionRun> unresolved = new ArrayList<>();
+            for (ConstructionRun run : runs) {
+                if (!run.scheduled) unresolved.add(run);
+            }
+            unresolved.sort(priority);
+            for (ConstructionRun run : unresolved) {
+                List<BuildEntry> ordered = orderConstructionRun(run, entriesByPos, cursor);
+                result.addAll(ordered);
+                if (!ordered.isEmpty()) cursor = ordered.get(ordered.size() - 1).pos();
+            }
+        }
+        return result;
+    }
+
+    private List<ConstructionRun> collectConstructionRuns(List<BuildEntry> entries,
+                                                           Map<BlockPos, BuildEntry> entriesByPos,
+                                                           BlockPos start) {
+        List<BuildEntry> seeds = new ArrayList<>(entries);
+        seeds.sort(Comparator
+                .comparingInt((BuildEntry entry) -> entry.pos().getY())
+                .thenComparingInt(entry -> constructionPhase(entry))
+                .thenComparingInt(entry -> entry.category().getPriority())
+                .thenComparingInt(entry -> entry.pos().getX())
+                .thenComparingInt(entry -> entry.pos().getZ()));
+
+        Set<BlockPos> unassigned = new HashSet<>(entriesByPos.keySet());
+        List<ConstructionRun> runs = new ArrayList<>();
+        for (BuildEntry seed : seeds) {
+            if (!unassigned.remove(seed.pos())) continue;
+
+            List<BuildEntry> runEntries = new ArrayList<>();
+            ArrayDeque<BlockPos> open = new ArrayDeque<>();
+            open.add(seed.pos());
+            while (!open.isEmpty()) {
+                BlockPos pos = open.removeFirst();
+                BuildEntry current = entriesByPos.get(pos);
+                runEntries.add(current);
+
+                for (BlockPos neighbor : horizontalNeighbors(pos)) {
+                    BuildEntry candidate = entriesByPos.get(neighbor);
+                    if (candidate != null && unassigned.contains(neighbor)
+                            && belongsToSameRun(seed, candidate)) {
+                        unassigned.remove(neighbor);
+                        open.addLast(neighbor);
+                    }
+                }
+            }
+            runs.add(new ConstructionRun(
+                    runs.size(), runEntries, constructionPhase(seed), start));
+        }
+        return runs;
+    }
+
+    private void addDependencyAt(ConstructionRun run, BlockPos dependencyPos,
+                                 Map<BlockPos, Integer> runByPos) {
+        Integer dependencyId = runByPos.get(dependencyPos);
+        if (dependencyId != null && dependencyId != run.id) {
+            run.dependencies.add(dependencyId);
+        }
+    }
+
+    private List<BuildEntry> orderConstructionRun(ConstructionRun run,
+                                                   Map<BlockPos, BuildEntry> entriesByPos,
+                                                   BlockPos start) {
+        Block block = run.entries.get(0).state().getBlock();
+        if (block instanceof StairsBlock || block instanceof SlabBlock
+                || run.category == BlockCategory.WALL
+                || run.category == BlockCategory.INTERIOR_WALL
+                || run.category == BlockCategory.DECOR) {
+            return spatialSweepSort(run.entries, start);
+        }
+
+        Set<BlockPos> positions = new HashSet<>();
+        for (BuildEntry entry : run.entries) positions.add(entry.pos());
+        return orderComponentInsideOut(positions, entriesByPos, start);
+    }
+
+    private boolean belongsToSameRun(BuildEntry first, BuildEntry second) {
+        return first.pos().getY() == second.pos().getY()
+                && first.category() == second.category()
+                && constructionPhase(first) == constructionPhase(second)
+                && samePlacementSequenceState(first.state(), second.state());
+    }
+
+    private int constructionPhase(BuildEntry entry) {
+        if (entry.category() == BlockCategory.FOUNDATION) return 0;
+        if (entry.category() == BlockCategory.DECOR) return 3;
+        if (entry.category() == BlockCategory.CEILING
+                || entry.state().getBlock() instanceof StairsBlock
+                || entry.state().getBlock() instanceof SlabBlock) return 2;
+        return 1;
+    }
+
+    private boolean samePlacementSequenceState(BlockState first, BlockState second) {
+        if (first.getBlock() != second.getBlock()) return false;
+        if (first.getBlock() instanceof StairsBlock) {
+            return first.get(Properties.HORIZONTAL_FACING) == second.get(Properties.HORIZONTAL_FACING)
+                    && first.get(Properties.BLOCK_HALF) == second.get(Properties.BLOCK_HALF);
+        }
+        if (first.getBlock() instanceof SlabBlock) {
+            return first.get(Properties.SLAB_TYPE) == second.get(Properties.SLAB_TYPE);
+        }
+        return first.equals(second);
+    }
+
+    private static final class ConstructionRun {
+        private final int id;
+        private final List<BuildEntry> entries;
+        private final int phase;
+        private final int y;
+        private final BlockCategory category;
+        private final BlockPos anchor;
+        private final double startDistance;
+        private final Set<Integer> dependencies = new HashSet<>();
+        private final List<Integer> dependents = new ArrayList<>();
+        private int remainingDependencies;
+        private boolean scheduled;
+
+        private ConstructionRun(int id, List<BuildEntry> entries, int phase, BlockPos start) {
+            this.id = id;
+            this.entries = entries;
+            BuildEntry first = entries.get(0);
+            this.phase = phase;
+            this.y = first.pos().getY();
+            this.category = first.category();
+            this.anchor = entries.stream()
+                    .map(BuildEntry::pos)
+                    .min(Comparator.comparingInt(BlockPos::getX)
+                            .thenComparingInt(BlockPos::getZ))
+                    .orElse(first.pos());
+            this.startDistance = entries.stream()
+                    .mapToDouble(entry -> entry.squaredDistance(start))
+                    .min()
+                    .orElse(Double.MAX_VALUE);
+        }
+    }
+
+    /**
+     * Keeps each horizontally connected group with the same placement state together.
      * Less exposed cells are placed first so the outer edge does not hide the
      * remaining cells of a dense floor or wall from the player.
      */
@@ -228,7 +441,7 @@ public class BuildLogicSorter {
                 BuildEntry candidate = byPos.get(neighbor);
                 if (candidate != null
                         && candidate.pos().getY() == seed.pos().getY()
-                        && candidate.state().getBlock() == seed.state().getBlock()) {
+                        && samePlacementSequenceState(candidate.state(), seed.state())) {
                     open.addLast(neighbor);
                 }
             }

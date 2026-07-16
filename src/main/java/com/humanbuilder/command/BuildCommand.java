@@ -110,7 +110,7 @@ public class BuildCommand {
                             )
                         )
                     )
-                    // /humanbuilder mode [default|mixed|layered]
+                    // /humanbuilder mode [default|mixed|layered|realistic]
                     .then(ClientCommandManager.literal("mode")
                         .then(ClientCommandManager.literal("default")
                             .executes(ctx -> {
@@ -130,6 +130,13 @@ public class BuildCommand {
                             .executes(ctx -> {
                                 executor.setSortMode(com.humanbuilder.logic.SortMode.LAYERED);
                                 ctx.getSource().sendFeedback(Text.literal("§a[HB] Режим сортировки: §eстрого по слоям снизу вверх"));
+                                return 1;
+                            })
+                        )
+                        .then(ClientCommandManager.literal("realistic")
+                            .executes(ctx -> {
+                                executor.setSortMode(com.humanbuilder.logic.SortMode.REALISTIC);
+                                ctx.getSource().sendFeedback(Text.literal("§a[HB] Режим сортировки: §eлогичные серии с учетом опор"));
                                 return 1;
                             })
                         )

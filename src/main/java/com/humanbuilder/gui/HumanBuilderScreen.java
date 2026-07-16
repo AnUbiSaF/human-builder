@@ -117,7 +117,7 @@ public class HumanBuilderScreen extends Screen {
         stopButton.active = state != BuildState.IDLE;
         modeButton.active = canLoad;
         for (ButtonWidget button : originButtons) button.active = state == BuildState.PREVIEW;
-        modeButton.setMessage(Text.literal("Режим: " + executor.getSortMode().name()));
+        modeButton.setMessage(Text.literal("Режим: " + executor.getSortMode().getDisplayName()));
         hologramButton.setMessage(Text.literal(
                 "Голограмма: " + (executor.isHologramVisible() ? "ВКЛ" : "ВЫКЛ")));
     }
@@ -161,7 +161,8 @@ public class HumanBuilderScreen extends Screen {
 
     private void cycleMode() {
         SortMode next = switch (executor.getSortMode()) {
-            case LAYERED -> SortMode.MIXED;
+            case LAYERED -> SortMode.REALISTIC;
+            case REALISTIC -> SortMode.MIXED;
             case MIXED -> SortMode.DEFAULT;
             case DEFAULT -> SortMode.LAYERED;
         };

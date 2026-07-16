@@ -322,6 +322,19 @@ public class BlockPlacer {
         return state.get(Properties.HORIZONTAL_FACING).getPositiveHorizontalDegrees();
     }
 
+    /** States in one movement batch must not require a different placement gesture. */
+    public boolean canBatchPlacementStates(BlockState first, BlockState second) {
+        if (first.getBlock() != second.getBlock()) return false;
+        if (first.getBlock() instanceof StairsBlock) {
+            return first.get(Properties.HORIZONTAL_FACING) == second.get(Properties.HORIZONTAL_FACING)
+                    && first.get(Properties.BLOCK_HALF) == second.get(Properties.BLOCK_HALF);
+        }
+        if (first.getBlock() instanceof SlabBlock) {
+            return first.get(Properties.SLAB_TYPE) == second.get(Properties.SLAB_TYPE);
+        }
+        return first.equals(second);
+    }
+
     /** Compares properties that are directly controlled during placement. */
     public boolean matchesPlacementState(BlockState actual, BlockState desired) {
         if (actual.getBlock() != desired.getBlock()) return false;
