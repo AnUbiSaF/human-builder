@@ -18,9 +18,12 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.function.Predicate;
+import java.util.function.Predicate;
 
 /**
  * Moves the player using normal movement keys and collision-aware paths.
@@ -37,8 +40,8 @@ public class MovementController {
     private static final int MAX_GROUND_NODES = 5_000;
     private static final int MAX_FLIGHT_NODES = 7_000;
     private static final int REPLAN_AFTER_TICKS = 12;
-    private static final int ENDPOINT_REPLAN_TICKS = 8;
-    private static final double PROGRESS_EPSILON = 0.008;
+    private static final int ENDPOINT_REPLAN_TICKS = 16;
+    private static final double PROGRESS_EPSILON = 0.001;
     private static final int[][] HORIZONTAL_DIRECTIONS = {
             { 1, 0}, {-1, 0}, {0,  1}, {0, -1},
             { 1, 1}, { 1,-1}, {-1, 1}, {-1,-1}
@@ -63,15 +66,21 @@ public class MovementController {
     private Boolean flyingBeforeControl;
     private boolean flightOwned;
     private boolean routeFailed;
+    private boolean routeArrived;
     private String failureReason;
     private BlockPos blockingObstacle;
     private boolean planningPending;
     private int planningHoldTicks;
+    private Predicate<BlockPos> reservedBuildPosition = ignored -> false;
 
     public MovementController(MinecraftClient client, CameraSmoother camera, BlockPlacer placer) {
         this.client = client;
         this.camera = camera;
         this.placer = placer;
+    }
+
+    public void setReservedBuildPositionPredicate(Predicate<BlockPos> predicate) {
+        reservedBuildPosition = predicate == null ? ignored -> false : predicate;
     }
 
     public boolean walkTo(BlockPos target, BlockState state) {
@@ -106,6 +115,7 @@ public class MovementController {
         }
 
         routeFailed = false;
+        routeArrived = false;
         failureReason = null;
         blockingObstacle = null;
         holdStillForPlanning();
@@ -171,6 +181,7 @@ public class MovementController {
         }
 
         if (isAtDestination()) {
+            routeArrived = true;
             stop();
             return;
         }
@@ -246,7 +257,7 @@ public class MovementController {
 
         double speedLimit = finalWaypoint ? 0.38 : FLIGHT_CRUISE_SPEED;
         double horizontalSpeed = Math.min(speedLimit, horizontalDistance * 0.48);
-        double horizontalStopDistance = interactionReady ? 0.72 : (finalWaypoint ? 0.035 : 0.20);
+        double horizontalStopDistance = interactionReady ? 0.30 : (finalWaypoint ? 0.008 : 0.20);
         if (horizontalDistance < horizontalStopDistance) {
             horizontalSpeed = 0.0;
         }
@@ -260,7 +271,7 @@ public class MovementController {
 
         double dy = waypoint.y - player.getY();
         double desiredY = MathHelper.clamp(dy * 0.42, -0.40, 0.40);
-        double verticalStopDistance = interactionReady ? 0.70 : (finalWaypoint ? 0.05 : 0.18);
+        double verticalStopDistance = interactionReady ? 0.48 : (finalWaypoint ? 0.012 : 0.18);
         if (Math.abs(dy) < verticalStopDistance) {
             desiredY = 0.0;
         }
@@ -343,13 +354,14 @@ public class MovementController {
         failRoute("нет прогресса после повторного построения маршрута");
     }
 
-    public boolean isWithinReach(BlockPos pos) {
-        if (client.player == null) return false;
-        return client.player.getEyePos().distanceTo(Vec3d.ofCenter(pos)) <= REACH_DISTANCE;
+    public boolean hasArrived() {
+        return routeArrived;
     }
 
-    public boolean hasArrived() {
-        return active && isAtDestination();
+    public boolean consumeArrival() {
+        boolean arrived = routeArrived;
+        routeArrived = false;
+        return arrived;
     }
 
     public boolean isAtDestination() {
@@ -394,6 +406,7 @@ public class MovementController {
         flightOwned = false;
         flyingBeforeControl = null;
         routeFailed = false;
+        routeArrived = false;
         failureReason = null;
         blockingObstacle = null;
     }
@@ -404,6 +417,20 @@ public class MovementController {
 
     public BlockPos getTargetPos() {
         return targetBlockPos;
+    }
+
+    public String describeRoute() {
+        if (client.player == null || standingTarget == null) {
+            return "active=" + active + ", arrived=" + routeArrived
+                    + ", planning=" + planningPending + ", standing=none";
+        }
+        Vec3d player = client.player.getPos();
+        double horizontal = Math.hypot(standingTarget.x - player.x, standingTarget.z - player.z);
+        double vertical = Math.abs(standingTarget.y - player.y);
+        return String.format(Locale.ROOT,
+                "active=%s, arrived=%s, planning=%s, flying=%s, waypoint=%d/%d, horizontal=%.3f, vertical=%.3f",
+                active, routeArrived, planningPending, flyingRoute,
+                waypointIndex, waypoints.size(), horizontal, vertical);
     }
 
     public boolean hasRouteFailure() {
@@ -500,6 +527,7 @@ public class MovementController {
                     for (int dy = -2; dy <= 3; dy++) {
                         BlockPos candidate = targetPos.add(dx, dy, dz);
                         if (requireGround ? !isStandable(candidate) : !isBodyClear(candidate)) continue;
+                        if (intersectsReservedBuildSpace(candidate)) continue;
 
                         Vec3d feet = Vec3d.ofBottomCenter(candidate);
                         if (forceDifferent && (attemptedStandingPositions.contains(candidate)
@@ -737,6 +765,10 @@ public class MovementController {
                 && client.world.getFluidState(feet.up()).isEmpty();
     }
 
+    private boolean intersectsReservedBuildSpace(BlockPos feet) {
+        return reservedBuildPosition.test(feet) || reservedBuildPosition.test(feet.up());
+    }
+
     private void rememberBodyObstacle(BlockPos feet) {
         if (blockingObstacle != null || client.world == null) return;
         for (BlockPos pos : List.of(feet, feet.up())) {
@@ -785,6 +817,7 @@ public class MovementController {
     }
 
     private void failRoute(String reason) {
+        routeArrived = false;
         routeFailed = true;
         failureReason = reason;
         HumanBuilderMod.LOGGER.warn("[HumanBuilder] Navigation failed for {}: {}",
@@ -808,7 +841,11 @@ public class MovementController {
                 || waypointIndex != waypoints.size() - 1) return false;
         double horizontal = Math.hypot(standingTarget.x - playerPos.x, standingTarget.z - playerPos.z);
         double vertical = Math.abs(standingTarget.y - playerPos.y);
-        return horizontal < 0.13 && vertical < 0.16 && !canInteractFromCurrentPosition();
+        Vec3d velocity = client.player.getVelocity();
+        boolean settled = Math.hypot(velocity.x, velocity.z) < 0.015
+                && Math.abs(velocity.y) < 0.015;
+        return horizontal < 0.025 && vertical < 0.035 && settled
+                && !canInteractFromCurrentPosition();
     }
 
     private void scheduleRoutePlanning(int holdTicks) {

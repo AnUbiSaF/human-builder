@@ -72,6 +72,7 @@ public class BlockPlacer {
         ClientPlayerEntity player = client.player;
         ClientPlayerInteractionManager im = client.interactionManager;
         if (player == null || im == null) return false;
+        if (wouldPlacementIntersectPlayer(targetPos, state)) return false;
 
         // ── 1. Переключить хотбар на нужный блок ─────────────────────
         if (!switchToBlock(state)) {
@@ -333,6 +334,19 @@ public class BlockPlacer {
             return first.get(Properties.SLAB_TYPE) == second.get(Properties.SLAB_TYPE);
         }
         return first.equals(second);
+    }
+
+    /** True when the desired block's real collision shape overlaps the player. */
+    public boolean wouldPlacementIntersectPlayer(BlockPos targetPos, BlockState state) {
+        if (client.player == null || client.world == null) return false;
+        Box playerBox = client.player.getBoundingBox();
+        VoxelShape collision = state.getCollisionShape(client.world, targetPos);
+        for (Box localBox : collision.getBoundingBoxes()) {
+            Box worldBox = localBox.offset(
+                    targetPos.getX(), targetPos.getY(), targetPos.getZ());
+            if (playerBox.intersects(worldBox)) return true;
+        }
+        return false;
     }
 
     /** Compares properties that are directly controlled during placement. */

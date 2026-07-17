@@ -24,6 +24,9 @@ import java.util.*;
  */
 public class BuildLogicSorter {
 
+    private static final int REALISTIC_ZONE_SIZE = 6;
+    private static final int REALISTIC_LIFT_HEIGHT = 3;
+
     /** Classifies blocks without running any route-ordering algorithm. */
     public List<BuildEntry> categorize(Map<BlockPos, BlockState> blocks) {
         if (blocks.isEmpty()) return Collections.emptyList();
@@ -232,9 +235,12 @@ public class BuildLogicSorter {
 
         Comparator<ConstructionRun> priority = Comparator
                 .comparingInt((ConstructionRun run) -> run.phase)
+                .thenComparingInt(run -> run.liftBand)
+                .thenComparingDouble(run -> run.zoneDistance)
+                .thenComparingInt(run -> run.zoneX)
+                .thenComparingInt(run -> run.zoneZ)
                 .thenComparingInt(run -> run.y)
                 .thenComparingInt(run -> run.category.getPriority())
-                .thenComparingDouble(run -> run.startDistance)
                 .thenComparingInt(run -> run.anchor.getX())
                 .thenComparingInt(run -> run.anchor.getZ());
         PriorityQueue<ConstructionRun> ready = new PriorityQueue<>(priority);
@@ -280,6 +286,9 @@ public class BuildLogicSorter {
     private List<ConstructionRun> collectConstructionRuns(List<BuildEntry> entries,
                                                            Map<BlockPos, BuildEntry> entriesByPos,
                                                            BlockPos start) {
+        int minX = entries.stream().mapToInt(entry -> entry.pos().getX()).min().orElse(0);
+        int minY = entries.stream().mapToInt(entry -> entry.pos().getY()).min().orElse(0);
+        int minZ = entries.stream().mapToInt(entry -> entry.pos().getZ()).min().orElse(0);
         List<BuildEntry> seeds = new ArrayList<>(entries);
         seeds.sort(Comparator
                 .comparingInt((BuildEntry entry) -> entry.pos().getY())
@@ -304,14 +313,15 @@ public class BuildLogicSorter {
                 for (BlockPos neighbor : horizontalNeighbors(pos)) {
                     BuildEntry candidate = entriesByPos.get(neighbor);
                     if (candidate != null && unassigned.contains(neighbor)
-                            && belongsToSameRun(seed, candidate)) {
+                            && belongsToSameRun(seed, candidate, minX, minZ)) {
                         unassigned.remove(neighbor);
                         open.addLast(neighbor);
                     }
                 }
             }
             runs.add(new ConstructionRun(
-                    runs.size(), runEntries, constructionPhase(seed), start));
+                    runs.size(), runEntries, constructionPhase(seed), start,
+                    minX, minY, minZ));
         }
         return runs;
     }
@@ -340,11 +350,18 @@ public class BuildLogicSorter {
         return orderComponentInsideOut(positions, entriesByPos, start);
     }
 
-    private boolean belongsToSameRun(BuildEntry first, BuildEntry second) {
+    private boolean belongsToSameRun(BuildEntry first, BuildEntry second,
+                                     int minX, int minZ) {
         return first.pos().getY() == second.pos().getY()
                 && first.category() == second.category()
                 && constructionPhase(first) == constructionPhase(second)
+                && workZone(first.pos().getX(), minX) == workZone(second.pos().getX(), minX)
+                && workZone(first.pos().getZ(), minZ) == workZone(second.pos().getZ(), minZ)
                 && samePlacementSequenceState(first.state(), second.state());
+    }
+
+    private int workZone(int coordinate, int minimum) {
+        return Math.floorDiv(coordinate - minimum, REALISTIC_ZONE_SIZE);
     }
 
     private int constructionPhase(BuildEntry entry) {
@@ -375,13 +392,17 @@ public class BuildLogicSorter {
         private final int y;
         private final BlockCategory category;
         private final BlockPos anchor;
-        private final double startDistance;
+        private final int liftBand;
+        private final int zoneX;
+        private final int zoneZ;
+        private final double zoneDistance;
         private final Set<Integer> dependencies = new HashSet<>();
         private final List<Integer> dependents = new ArrayList<>();
         private int remainingDependencies;
         private boolean scheduled;
 
-        private ConstructionRun(int id, List<BuildEntry> entries, int phase, BlockPos start) {
+        private ConstructionRun(int id, List<BuildEntry> entries, int phase, BlockPos start,
+                                int minX, int minY, int minZ) {
             this.id = id;
             this.entries = entries;
             BuildEntry first = entries.get(0);
@@ -393,10 +414,16 @@ public class BuildLogicSorter {
                     .min(Comparator.comparingInt(BlockPos::getX)
                             .thenComparingInt(BlockPos::getZ))
                     .orElse(first.pos());
-            this.startDistance = entries.stream()
-                    .mapToDouble(entry -> entry.squaredDistance(start))
-                    .min()
-                    .orElse(Double.MAX_VALUE);
+            this.liftBand = Math.floorDiv(y - minY, REALISTIC_LIFT_HEIGHT);
+            this.zoneX = Math.floorDiv(anchor.getX() - minX, REALISTIC_ZONE_SIZE);
+            this.zoneZ = Math.floorDiv(anchor.getZ() - minZ, REALISTIC_ZONE_SIZE);
+            double centerX = minX + zoneX * REALISTIC_ZONE_SIZE
+                    + REALISTIC_ZONE_SIZE * 0.5;
+            double centerZ = minZ + zoneZ * REALISTIC_ZONE_SIZE
+                    + REALISTIC_ZONE_SIZE * 0.5;
+            double dx = centerX - start.getX();
+            double dz = centerZ - start.getZ();
+            this.zoneDistance = dx * dx + dz * dz;
         }
     }
 

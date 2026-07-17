@@ -34,6 +34,8 @@ public class BuildExecutor {
 
     private static final int MAX_BREAK_CHAIN = 6;
     private static final int MAX_BREAK_NAVIGATION_FAILURES = 3;
+    private static final int REALISTIC_BATCH_LIMIT = 36;
+    private static final int REALISTIC_BATCH_RADIUS = 5;
     private static final long BASE_NAVIGATION_COOLDOWN_TICKS = 40L;
     private static final int WALKING_WATCHDOG_TICKS = 600;
 
@@ -151,6 +153,7 @@ public class BuildExecutor {
         this.placer = placer;
         this.timing = timing;
         this.sorter = new BuildLogicSorter();
+        this.movement.setReservedBuildPositionPredicate(pendingEntries::containsKey);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -672,10 +675,24 @@ public class BuildExecutor {
             return;
         }
 
+        // Movement verified the exact support-face hit when it completed the
+        // route. Preserve that decision across the client-tick boundary.
+        if (!movement.isActive() && movement.hasArrived()) {
+            boolean reachedCurrentTarget = Objects.equals(
+                    currentEntry.pos(), movement.getTargetPos());
+            movement.consumeArrival();
+            if (reachedCurrentTarget) {
+                placementFailed = false;
+                setState(BuildState.LOOKING);
+                return;
+            }
+        }
+
+        if (moveOutOfCurrentTargetIfNeeded()) return;
+
         // Если ходьба была инициирована из-за неуспешной установки блока
         if (placementFailed) {
-            if (movement.isWithinReach(currentEntry.pos())
-                    && placer.canPlaceFromCurrentPosition(currentEntry.pos(), currentEntry.state())) {
+            if (placer.canPlaceFromCurrentPosition(currentEntry.pos(), currentEntry.state())) {
                 movement.stop();
                 placementFailed = false;
                 setState(BuildState.LOOKING);
@@ -685,9 +702,10 @@ public class BuildExecutor {
             return;
         }
 
-        // Distance alone is insufficient: a wall may hide every support face.
-        if (movement.isWithinReach(currentEntry.pos())
-                && placer.canPlaceFromCurrentPosition(currentEntry.pos(), currentEntry.state())) {
+        // The real hit face already includes reach and line-of-sight checks.
+        // A second center-distance check disagreed near roof edges and caused
+        // completed routes to restart forever.
+        if (placer.canPlaceFromCurrentPosition(currentEntry.pos(), currentEntry.state())) {
             movement.stop();
             setState(BuildState.LOOKING);
             return;
@@ -704,6 +722,8 @@ public class BuildExecutor {
             setState(BuildState.SORTING);
             return;
         }
+
+        if (moveOutOfCurrentTargetIfNeeded()) return;
 
         // ── 1. Проверяем готовность блока в руке ──────────────────────
         // Если нужный блок еще не в руке (например, только берем из креатива),
@@ -769,6 +789,7 @@ public class BuildExecutor {
         }
 
         if (handleOccupiedCurrentTarget()) return;
+        if (moveOutOfCurrentTargetIfNeeded()) return;
 
         // Проверяем, действительно ли нужный блок сейчас в руке
         if (!placer.isReady(currentEntry.state())) {
@@ -825,6 +846,9 @@ public class BuildExecutor {
             // Если не удалось поставить блок 3 раза подряд с разных точек обхода
             if (placementFailureCount >= 3) {
                 sendMessage("§e[HB] ⚠ Не удалось установить блок на " + currentPos.toShortString() + " после 3 попыток. Откладываю в конец очереди.");
+                navigationRetryAfter.put(currentPos,
+                        executorTicks + BASE_NAVIGATION_COOLDOWN_TICKS);
+                activeBatch.remove(currentPos);
                 offerQueuedEntry(currentEntry);
                 currentEntry = null;
                 placementFailed = false;
@@ -835,7 +859,9 @@ public class BuildExecutor {
             }
 
             // Не удалось поставить — пробуем переместиться
-            sendMessage("§7[HB] Не могу поставить блок, перемещаюсь...");
+            if (placementFailureCount == 1) {
+                sendMessage("§7[HB] Не могу поставить блок, меняю позицию...");
+            }
             placementFailed = true;
             setState(BuildState.WALKING);
         }
@@ -911,6 +937,29 @@ public class BuildExecutor {
                 forceDifferent || retryingNavigation)) {
             handleNavigationFailure(movement.consumeFailureReason());
         }
+    }
+
+    private boolean moveOutOfCurrentTargetIfNeeded() {
+        if (currentEntry == null
+                || !placer.wouldPlacementIntersectPlayer(
+                        currentEntry.pos(), currentEntry.state())) {
+            return false;
+        }
+
+        boolean needsNewRoute = !movement.isActive() || state != BuildState.WALKING;
+        camera.stop();
+        placementFailed = true;
+        if (state != BuildState.WALKING) {
+            movement.stop();
+            setState(BuildState.WALKING);
+        }
+        if (needsNewRoute && !movement.isActive()) {
+            HumanBuilderMod.LOGGER.info(
+                    "[HumanBuilder] Target {} intersects the player; moving to a safe standing point",
+                    currentEntry.pos().toShortString());
+            beginWalking(true);
+        }
+        return true;
     }
 
     private boolean handleOccupiedCurrentTarget() {
@@ -1144,8 +1193,8 @@ public class BuildExecutor {
         }
         if (diagnosticTargetTicks >= 200 && diagnosticTargetTicks % 200 == 0) {
             HumanBuilderMod.LOGGER.warn(
-                    "[HumanBuilder] No completed progress for {} ticks: state={}, target={}, movementActive={}",
-                    diagnosticTargetTicks, state, target.toShortString(), movement.isActive());
+                    "[HumanBuilder] No completed progress for {} ticks: state={}, target={}, route={}",
+                    diagnosticTargetTicks, state, target.toShortString(), movement.describeRoute());
         }
     }
 
@@ -1163,12 +1212,20 @@ public class BuildExecutor {
             if (candidate == null
                     || candidate.pos().getY() != seed.pos().getY()
                     || !placer.canBatchPlacementStates(candidate.state(), seed.state())
+                    || !canJoinAdjacentBatch(seed.pos(), pos)
                     || !activeBatch.add(pos)) continue;
             open.addLast(pos.east());
             open.addLast(pos.west());
             open.addLast(pos.south());
             open.addLast(pos.north());
         }
+    }
+
+    private boolean canJoinAdjacentBatch(BlockPos seed, BlockPos candidate) {
+        if (sortMode != SortMode.REALISTIC) return true;
+        return activeBatch.size() < REALISTIC_BATCH_LIMIT
+                && Math.abs(candidate.getX() - seed.getX()) <= REALISTIC_BATCH_RADIUS
+                && Math.abs(candidate.getZ() - seed.getZ()) <= REALISTIC_BATCH_RADIUS;
     }
 
     private void initializeBuildQueues(Collection<BuildEntry> entries) {
