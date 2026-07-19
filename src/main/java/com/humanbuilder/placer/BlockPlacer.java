@@ -925,11 +925,14 @@ public class BlockPlacer {
                         RaycastContext.FluidHandling.NONE, client.player
                 ));
                 if (result.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
-                        && result.getBlockPos().equals(supportPos)
-                        && result.getSide() == clickFace) {
-                    // Keep the deliberate 0.25/0.75 hit height. The raycast
-                    // intersection may drift across SlabBlock's 0.5 threshold.
-                    return new BlockHitResult(hitVec, clickFace, supportPos, false);
+                        && result.getBlockPos().equals(supportPos)) {
+                    Direction sideToUse = (result.getSide() == clickFace
+                            || producesDesiredClickedFacing(state, supportState, result.getSide()))
+                            ? result.getSide()
+                            : clickFace;
+                    if (producesDesiredHalf(hitVec, targetPos, sideToUse, state)) {
+                        return new BlockHitResult(hitVec, sideToUse, supportPos, false);
+                    }
                 }
                 if (result.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
                         && !result.getBlockPos().equals(supportPos)
@@ -1028,6 +1031,14 @@ public class BlockPlacer {
         double desiredY = targetPos.getY() + (top ? 0.75 : 0.25);
         double minY = supportPos.getY() + supportBox.minY + 0.02;
         double maxY = supportPos.getY() + supportBox.maxY - 0.02;
+
+        if (top && maxY <= targetPos.getY() + 0.5) {
+            return hit;
+        }
+        if (!top && minY >= targetPos.getY() + 0.5) {
+            return hit;
+        }
+
         return new Vec3d(hit.x, Math.max(minY, Math.min(maxY, desiredY)), hit.z);
     }
 
@@ -1081,10 +1092,11 @@ public class BlockPlacer {
                     RaycastContext.FluidHandling.NONE, client.player
             ));
             if (result.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
-                    && result.getBlockPos().equals(targetPos)
-                    && result.getSide() == clickFace) {
-                return new BlockHitResult(hit, clickFace, targetPos, false);
+                    && result.getBlockPos().equals(targetPos)) {
+                Direction sideToUse = result.getSide() != null ? result.getSide() : clickFace;
+                return new BlockHitResult(hit, sideToUse, targetPos, false);
             }
+            return new BlockHitResult(hit, clickFace, targetPos, false);
         }
         return null;
     }
