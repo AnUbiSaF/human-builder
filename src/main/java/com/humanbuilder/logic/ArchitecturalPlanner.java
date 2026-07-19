@@ -59,6 +59,7 @@ public final class ArchitecturalPlanner {
     public static final int MIN_LAYERED_BASE_HEIGHT = 1;
     public static final int MAX_LAYERED_BASE_HEIGHT = 8;
     public static final int DEFAULT_LAYERED_BASE_HEIGHT = 1;
+    private static final int MAX_EXTERIOR_WALL_DEPTH = 1;
 
     private int layeredBaseHeight = DEFAULT_LAYERED_BASE_HEIGHT;
 
@@ -174,14 +175,20 @@ public final class ArchitecturalPlanner {
             Map<BlockPos, BlockState> blocks
     ) {
         Bounds bounds = Bounds.of(component);
-        OutdoorAirIndex outdoor = OutdoorAirIndex.create(component, bounds);
+        OutdoorAirIndex outdoor = OutdoorAirIndex.create(component);
         Set<BlockPos> roof = findRoof(component, blocks, outdoor, bounds);
+        Map<BlockPos, Set<Direction>> outdoorFacesByPosition = new HashMap<>();
+        for (BlockPos pos : component) {
+            outdoorFacesByPosition.put(pos, outdoor.horizontalFaces(pos));
+        }
+        Set<BlockPos> opaqueShell = findOpaqueShell(
+                component, blocks, outdoorFacesByPosition);
         EnumMap<Phase, Set<BlockPos>> positionsByPhase = new EnumMap<>(Phase.class);
         for (Phase phase : Phase.values()) positionsByPhase.put(phase, new HashSet<>());
 
         for (BlockPos pos : component) {
             BlockState state = blocks.get(pos);
-            Set<Direction> outdoorFaces = outdoor.horizontalFaces(pos);
+            Set<Direction> outdoorFaces = outdoorFacesByPosition.get(pos);
             boolean exteriorVisible = !outdoorFaces.isEmpty() || outdoor.isOutdoorAir(pos.up());
             Phase phase;
 
@@ -192,6 +199,8 @@ public final class ArchitecturalPlanner {
                 phase = Phase.CONTOUR;
             } else if (roof.contains(pos) && !isPureDetail(state) && !isGlass(state)) {
                 phase = Phase.ROOF;
+            } else if (opaqueShell.contains(pos)) {
+                phase = Phase.OPAQUE_SHELL;
             } else if (!outdoorFaces.isEmpty()) {
                 phase = isExteriorFinishElement(state)
                         ? Phase.EXTERIOR_FINISH
@@ -207,6 +216,35 @@ public final class ArchitecturalPlanner {
         }
         connectContourToFoundation(positionsByPhase, component, blocks, bounds);
         return positionsByPhase;
+    }
+
+    private Set<BlockPos> findOpaqueShell(
+            Set<BlockPos> component,
+            Map<BlockPos, BlockState> blocks,
+            Map<BlockPos, Set<Direction>> outdoorFacesByPosition
+    ) {
+        Set<BlockPos> shell = new HashSet<>();
+        for (BlockPos pos : component) {
+            if (!outdoorFacesByPosition.get(pos).isEmpty()
+                    && isContourEligible(blocks.get(pos))) {
+                shell.add(pos);
+            }
+        }
+
+        for (BlockPos surface : List.copyOf(shell)) {
+            for (Direction exteriorFace : outdoorFacesByPosition.get(surface)) {
+                BlockPos cursor = surface;
+                for (int depth = 0; depth < MAX_EXTERIOR_WALL_DEPTH; depth++) {
+                    cursor = cursor.offset(exteriorFace.getOpposite());
+                    if (!component.contains(cursor)
+                            || !isContourEligible(blocks.get(cursor))) {
+                        break;
+                    }
+                    shell.add(cursor);
+                }
+            }
+        }
+        return shell;
     }
 
     private Map<BlockPos, Phase> collectLayer(
@@ -826,44 +864,59 @@ public final class ArchitecturalPlanner {
         }
     }
 
-    /** Outdoor air is sky-visible air, including open courtyards and one-block eaves. */
+    /**
+     * Air visible from the sky or along an unobstructed horizontal exterior ray.
+     * Horizontal rays recognize deep walls below wide eaves without flooding
+     * through glass into closed rooms.
+     */
     private static final class OutdoorAirIndex {
         private final Set<BlockPos> occupied;
-        private final Set<Long> directSkyAir;
+        private final Map<Long, Integer> highestYByXZ;
+        private final Map<Long, Extent> xExtentByYZ;
+        private final Map<Long, Extent> zExtentByXY;
 
-        private OutdoorAirIndex(Set<BlockPos> occupied, Set<Long> directSkyAir) {
+        private OutdoorAirIndex(
+                Set<BlockPos> occupied,
+                Map<Long, Integer> highestYByXZ,
+                Map<Long, Extent> xExtentByYZ,
+                Map<Long, Extent> zExtentByXY
+        ) {
             this.occupied = occupied;
-            this.directSkyAir = directSkyAir;
+            this.highestYByXZ = highestYByXZ;
+            this.xExtentByYZ = xExtentByYZ;
+            this.zExtentByXY = zExtentByXY;
         }
 
-        static OutdoorAirIndex create(Set<BlockPos> occupied, Bounds bounds) {
-            Set<Long> directSky = new HashSet<>();
-            for (int x = bounds.minX() - 2; x <= bounds.maxX() + 2; x++) {
-                for (int z = bounds.minZ() - 2; z <= bounds.maxZ() + 2; z++) {
-                    boolean blocked = false;
-                    for (int y = bounds.maxY() + 2; y >= bounds.minY() - 1; y--) {
-                        BlockPos pos = new BlockPos(x, y, z);
-                        if (occupied.contains(pos)) {
-                            blocked = true;
-                        } else if (!blocked) {
-                            directSky.add(pos.asLong());
-                        }
-                    }
-                }
+        static OutdoorAirIndex create(Set<BlockPos> occupied) {
+            Map<Long, Integer> highestYByXZ = new HashMap<>();
+            Map<Long, Extent> xExtentByYZ = new HashMap<>();
+            Map<Long, Extent> zExtentByXY = new HashMap<>();
+            for (BlockPos pos : occupied) {
+                highestYByXZ.merge(
+                        pair(pos.getX(), pos.getZ()), pos.getY(), Math::max);
+                xExtentByYZ.merge(
+                        pair(pos.getY(), pos.getZ()),
+                        new Extent(pos.getX(), pos.getX()),
+                        Extent::merge);
+                zExtentByXY.merge(
+                        pair(pos.getX(), pos.getY()),
+                        new Extent(pos.getZ(), pos.getZ()),
+                        Extent::merge);
             }
-            return new OutdoorAirIndex(occupied, directSky);
+            return new OutdoorAirIndex(
+                    occupied, highestYByXZ, xExtentByYZ, zExtentByXY);
         }
 
         boolean isOutdoorAir(BlockPos pos) {
             if (occupied.contains(pos)) return false;
-            if (directSkyAir.contains(pos.asLong())) return true;
-            for (Direction direction : Direction.Type.HORIZONTAL) {
-                BlockPos neighbor = pos.offset(direction);
-                if (!occupied.contains(neighbor) && directSkyAir.contains(neighbor.asLong())) {
-                    return true;
-                }
-            }
-            return false;
+            Integer highestY = highestYByXZ.get(pair(pos.getX(), pos.getZ()));
+            if (highestY == null || pos.getY() > highestY) return true;
+
+            Extent xExtent = xExtentByYZ.get(pair(pos.getY(), pos.getZ()));
+            if (xExtent == null || xExtent.isOutside(pos.getX())) return true;
+
+            Extent zExtent = zExtentByXY.get(pair(pos.getX(), pos.getY()));
+            return zExtent == null || zExtent.isOutside(pos.getZ());
         }
 
         Set<Direction> horizontalFaces(BlockPos pos) {
@@ -872,6 +925,22 @@ public final class ArchitecturalPlanner {
                 if (isOutdoorAir(pos.offset(direction))) result.add(direction);
             }
             return result;
+        }
+
+        private static long pair(int first, int second) {
+            return ((long) first << 32) ^ (second & 0xffffffffL);
+        }
+
+        private record Extent(int min, int max) {
+            static Extent merge(Extent first, Extent second) {
+                return new Extent(
+                        Math.min(first.min, second.min),
+                        Math.max(first.max, second.max));
+            }
+
+            boolean isOutside(int value) {
+                return value < min || value > max;
+            }
         }
     }
 }

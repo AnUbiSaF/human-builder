@@ -36,6 +36,8 @@ public class MovementController {
     private static final double FINAL_DISTANCE = 0.20;
     private static final double FLIGHT_FINAL_HORIZONTAL_DISTANCE = 0.12;
     private static final double FLIGHT_FINAL_VERTICAL_DISTANCE = 0.08;
+    private static final double FLIGHT_ENDPOINT_CAPTURE_DISTANCE = 0.30;
+    private static final double FLIGHT_ENDPOINT_MAX_VERTICAL_SPEED = 0.14;
     private static final double BUILD_CLEARANCE_MARGIN = 0.08;
     private static final double FLIGHT_CRUISE_SPEED = 0.48;
     private static final double FLIGHT_ACCELERATION = 0.16;
@@ -193,7 +195,7 @@ public class MovementController {
         }
         noProgressTicks = 0;
         blockedEndpointTicks = 0;
-        scheduleRoutePlanning(1);
+        scheduleRoutePlanning(cinematicMode && canUseCreativeFlight() ? 0 : 1);
         return true;
     }
 
@@ -230,8 +232,8 @@ public class MovementController {
                 }
                 active = false;
                 failRoute("безопасный маршрут не найден ни к одной доступной точке установки");
+                return;
             }
-            return;
         }
 
         ClientPlayerEntity player = client.player;
@@ -359,6 +361,8 @@ public class MovementController {
         double acceleration;
 
         double dy = waypoint.y - player.getY();
+        boolean captureFinalY = finalWaypoint
+                && Math.abs(dy) <= FLIGHT_ENDPOINT_CAPTURE_DISTANCE;
 
         if (cinematicMode) {
             if (cinematicFast) {
@@ -394,13 +398,20 @@ public class MovementController {
                 ? (waypoint.z - player.getZ()) / horizontalDistance * horizontalSpeed
                 : 0.0;
 
-        if (Math.abs(dy) < verticalStopDistance) {
+        if (captureFinalY) {
+            // Proportional flight velocity never reaches an exact Y on some
+            // servers because drag rounds the last millimetres away. Inside
+            // the capture zone, consume the remaining delta in finite steps.
+            desiredY = endpointVerticalVelocity(dy);
+        } else if (Math.abs(dy) < verticalStopDistance) {
             desiredY = 0.0;
         }
 
         player.setVelocity(
                 approach(currentVelocity.x, desiredX, acceleration),
-                approach(currentVelocity.y, desiredY, acceleration),
+                captureFinalY
+                        ? desiredY
+                        : approach(currentVelocity.y, desiredY, acceleration),
                 approach(currentVelocity.z, desiredZ, acceleration)
         );
     }
@@ -1041,6 +1052,13 @@ public class MovementController {
     static boolean isWithinPreciseFlightEndpoint(double horizontal, double vertical) {
         return horizontal < FLIGHT_FINAL_HORIZONTAL_DISTANCE
                 && vertical < FLIGHT_FINAL_VERTICAL_DISTANCE;
+    }
+
+    static double endpointVerticalVelocity(double deltaY) {
+        return MathHelper.clamp(
+                deltaY,
+                -FLIGHT_ENDPOINT_MAX_VERTICAL_SPEED,
+                FLIGHT_ENDPOINT_MAX_VERTICAL_SPEED);
     }
 
     private boolean isBlockedAtFinalApproach(Vec3d playerPos) {

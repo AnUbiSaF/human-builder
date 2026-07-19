@@ -771,16 +771,6 @@ public class BuildExecutor {
             return;
         }
 
-        // A block may be placed while the player is still flying. Retarget the
-        // active cinematic route immediately instead of finishing the obsolete
-        // route and only then starting an approach to the new build cell.
-        if (sortMode.isCinematic()
-                && movement.isActive()
-                && !Objects.equals(movement.getTargetPos(), currentEntry.pos())) {
-            beginWalking(false);
-            if (state != BuildState.WALKING) return;
-        }
-
         // В кинематографическом режиме проверяем установку прямо на лету
         if (sortMode.isCinematic()) {
             boolean playerClear = !placer.wouldPlacementIntersectPlayer(
@@ -839,6 +829,15 @@ public class BuildExecutor {
                     camera.stop();
                 }
             }
+        }
+
+        // Keep the current flight lane while a row is still reachable. Only
+        // retarget after the in-flight placement fast path actually failed.
+        if (sortMode.isCinematic()
+                && movement.isActive()
+                && !Objects.equals(movement.getTargetPos(), currentEntry.pos())) {
+            beginWalking(false);
+            if (state != BuildState.WALKING) return;
         }
 
         // Movement verified the exact support-face hit when it completed the

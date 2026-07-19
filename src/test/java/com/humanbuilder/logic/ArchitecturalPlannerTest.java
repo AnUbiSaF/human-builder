@@ -68,6 +68,28 @@ class ArchitecturalPlannerTest {
     }
 
     @Test
+    void deepFacadeBelowWideRoofRemainsPartOfTheShell() {
+        Map<BlockPos, BlockState> blocks = coveredOpenBuilding();
+        List<BuildEntry> plan = new ArchitecturalPlanner().plan(
+                blocks, new BlockPos(4, 1, -3));
+
+        assertEquals(BlockCategory.WALL,
+                categoryAt(plan, new BlockPos(4, 2, 6)),
+                "a wall several blocks below an overhang must not become interior fill");
+    }
+
+    @Test
+    void secondLayerOfExteriorWallIsPartOfTheShell() {
+        Map<BlockPos, BlockState> blocks = enclosedTwoBlockFacade();
+        List<BuildEntry> plan = new ArchitecturalPlanner().plan(
+                blocks, new BlockPos(4, 1, 11));
+
+        assertEquals(BlockCategory.WALL,
+                categoryAt(plan, new BlockPos(4, 2, 6)),
+                "the inner half of a two-block exterior wall belongs to its shell");
+    }
+
+    @Test
     void facadeWorkFrontsNeverExceedThreeVerticalBlocks() {
         List<BuildEntry> plan = new ArchitecturalPlanner().plan(
                 courtyardBuilding(), new BlockPos(-2, 1, 4));
@@ -261,6 +283,45 @@ class ArchitecturalPlannerTest {
             }
         }
         return blocks;
+    }
+
+    private Map<BlockPos, BlockState> coveredOpenBuilding() {
+        Map<BlockPos, BlockState> blocks = new HashMap<>();
+        addFloorAndRoof(blocks);
+        for (int x = 0; x <= 8; x++) {
+            for (int y = 1; y <= 3; y++) {
+                blocks.put(new BlockPos(x, y, 6), null);
+            }
+        }
+        return blocks;
+    }
+
+    private Map<BlockPos, BlockState> enclosedTwoBlockFacade() {
+        Map<BlockPos, BlockState> blocks = new HashMap<>();
+        addFloorAndRoof(blocks);
+        for (int y = 1; y <= 3; y++) {
+            for (int x = 0; x <= 8; x++) {
+                blocks.put(new BlockPos(x, y, 6), null);
+                blocks.put(new BlockPos(x, y, 7), null);
+            }
+            for (int z = 0; z <= 7; z++) {
+                blocks.put(new BlockPos(0, y, z), null);
+                blocks.put(new BlockPos(8, y, z), null);
+            }
+            for (int x = 1; x < 8; x++) {
+                blocks.put(new BlockPos(x, y, 0), null);
+            }
+        }
+        return blocks;
+    }
+
+    private void addFloorAndRoof(Map<BlockPos, BlockState> blocks) {
+        for (int x = 0; x <= 8; x++) {
+            for (int z = 0; z <= 8; z++) {
+                blocks.put(new BlockPos(x, 0, z), null);
+                blocks.put(new BlockPos(x, 4, z), null);
+            }
+        }
     }
 
     private int stageRank(BlockCategory category) {
