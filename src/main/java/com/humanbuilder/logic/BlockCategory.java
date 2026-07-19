@@ -1,30 +1,14 @@
 package com.humanbuilder.logic;
 
-/**
- * Категории блоков для логической сортировки.
- *
- * Приоритет определяет порядок строительства:
- * фундамент → стены → перегородки → полы → крыша → декор.
- */
+/** Logical role used for ordering, timing and hologram colors. */
 public enum BlockCategory {
-
-    /** Нижний слой постройки (Y == minY) */
-    FOUNDATION(0, "Фундамент"),
-
-    /** Внешние стены (на границе X/Z структуры) */
-    WALL(1, "Стены"),
-
-    /** Внутренние перегородки (между комнатами) */
-    INTERIOR_WALL(2, "Перегородки"),
-
-    /** Заполнение пола, лестницы между этажами */
-    FLOOR(3, "Полы"),
-
-    /** Потолок / крыша (Y == maxY или slab/stairs) */
-    CEILING(4, "Крыша"),
-
-    /** Декоративные элементы: факелы, стёкла, двери, ковры */
-    DECOR(5, "Декор");
+    FOUNDATION(0, "Основание слоя"),
+    PILLAR(1, "Контур"),
+    WALL(2, "Основной каркас"),
+    ROOF(3, "Крыша"),
+    WINDOW(4, "Внешнее заполнение"),
+    INTERIOR_WALL(5, "Внутренние конструкции"),
+    DECOR(6, "Внутренние детали");
 
     private final int priority;
     private final String displayName;
@@ -34,6 +18,11 @@ public enum BlockCategory {
         this.displayName = displayName;
     }
 
-    public int getPriority()      { return priority; }
-    public String getDisplayName() { return displayName; }
+    public int getPriority() {
+        return priority;
+    }
+
+    public String getDisplayName() {
+        return displayName;
+    }
 }

@@ -1,6 +1,9 @@
 package com.humanbuilder.placer;
 
+import com.humanbuilder.HumanBuilderMod;
 import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
+import net.minecraft.block.FallingBlock;
 import net.minecraft.block.SlabBlock;
 import net.minecraft.block.StairsBlock;
 import net.minecraft.block.enums.BlockHalf;
@@ -8,6 +11,7 @@ import net.minecraft.block.enums.SlabType;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.network.ClientPlayerInteractionManager;
+import net.minecraft.fluid.Fluids;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.ItemStack;
 import net.minecraft.network.packet.c2s.play.CreativeInventoryActionC2SPacket;
@@ -18,10 +22,20 @@ import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Box;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.shape.VoxelShape;
 import net.minecraft.world.RaycastContext;
+import net.minecraft.world.WorldView;
 import net.minecraft.state.property.Properties;
+import net.minecraft.state.property.Property;
+
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 
 /**
  * Модуль установки блоков.
@@ -36,25 +50,89 @@ import net.minecraft.state.property.Properties;
  */
 public class BlockPlacer {
 
+    private static final Set<String> MANAGED_STATE_PROPERTIES = Set.of(
+            "facing", "axis", "half", "type", "rotation", "face",
+            "attachment", "hinge", "part"
+    );
+
     private final MinecraftClient client;
     private BlockPos lastPlacementObstruction;
     private BlockPos lastProbeObstruction;
+    private BlockPos lastProtectedDependent;
+    private boolean lineOfSightRequired = false;
 
-    /** Порядок проверки граней: приоритет снизу (как ставит человек) */
-    private static final Direction[] FACE_PRIORITY = {
-            Direction.DOWN,   // блок снизу (ставим сверху на него)
-            Direction.NORTH,
-            Direction.SOUTH,
-            Direction.EAST,
-            Direction.WEST,
-            Direction.UP      // блок сверху (ставим снизу — редко)
-    };
+    private Direction[] getFacePriority(BlockState state) {
+        if (state != null && state.contains(Properties.AXIS)) {
+            Direction.Axis axis = state.get(Properties.AXIS);
+            if (axis == Direction.Axis.Y) {
+                return new Direction[] {
+                        Direction.DOWN,   // блок снизу (ставим сверху на него)
+                        Direction.UP,     // блок сверху (ставим снизу — редко)
+                        Direction.NORTH,
+                        Direction.SOUTH,
+                        Direction.EAST,
+                        Direction.WEST
+                };
+            } else if (axis == Direction.Axis.X) {
+                return new Direction[] {
+                        Direction.WEST,   // опора с запада (клик по восточной грани)
+                        Direction.EAST,   // опора с востока (клик по западной грани)
+                        Direction.NORTH,
+                        Direction.SOUTH,
+                        Direction.DOWN,
+                        Direction.UP
+                };
+            } else if (axis == Direction.Axis.Z) {
+                return new Direction[] {
+                        Direction.NORTH,  // опора с севера (клик по южной грани)
+                        Direction.SOUTH,  // опора с юга (клик по северной грани)
+                        Direction.WEST,
+                        Direction.EAST,
+                        Direction.DOWN,
+                        Direction.UP
+                };
+            }
+        }
+
+        if (state != null && state.getBlock() instanceof net.minecraft.block.TrapdoorBlock) {
+            Direction facing = state.get(Properties.HORIZONTAL_FACING);
+            return new Direction[] {
+                    facing, // Опора со стороны петель
+                    Direction.DOWN,
+                    Direction.UP
+            };
+        }
+
+        // По умолчанию приоритет граней со стороны, чтобы избежать взгляда строго вниз при движении вперед
+        return new Direction[] {
+                Direction.NORTH,
+                Direction.SOUTH,
+                Direction.EAST,
+                Direction.WEST,
+                Direction.DOWN,   // блок снизу (ставим сверху на него)
+                Direction.UP      // блок сверху (ставим снизу — редко)
+        };
+    }
 
     /** Слот хотбара для creative-fill (последний слот) */
     private static final int CREATIVE_FILL_SLOT = 8;
 
     public BlockPlacer(MinecraftClient client) {
         this.client = client;
+    }
+
+    private com.humanbuilder.executor.BuildExecutor executor;
+
+    public void setExecutor(com.humanbuilder.executor.BuildExecutor executor) {
+        this.executor = executor;
+    }
+
+    public boolean isPlacedSchematicSupport(BlockPos pos) {
+        return executor != null && executor.isPlacedSchematicBlock(pos);
+    }
+
+    public void setLineOfSightRequired(boolean lineOfSightRequired) {
+        this.lineOfSightRequired = lineOfSightRequired;
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -72,6 +150,39 @@ public class BlockPlacer {
         ClientPlayerEntity player = client.player;
         ClientPlayerInteractionManager im = client.interactionManager;
         if (player == null || im == null) return false;
+
+        // OPEN is a post-placement action. Keep it in the same executor task so
+        // the next block cannot start before the server confirms the final state.
+        BlockState actual = client.world.getBlockState(targetPos);
+        if (canToggleOpenState(actual, state)) {
+            BlockHitResult hitResult = findToggleTarget(targetPos, actual, player.getEyePos());
+            if (hitResult != null) {
+                double dx = hitResult.getPos().x - player.getX();
+                double dy = hitResult.getPos().y - player.getEyeY();
+                double dz = hitResult.getPos().z - player.getZ();
+                double dxz = Math.sqrt(dx * dx + dz * dz);
+                float calculatedYaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+                float targetYaw = player.getYaw() + MathHelper.wrapDegrees(calculatedYaw - player.getYaw());
+                float targetPitch = (float) (-Math.toDegrees(Math.atan2(dy, dxz)));
+                targetPitch = MathHelper.clamp(targetPitch, -90.0f, 90.0f);
+
+                player.setYaw(targetYaw);
+                player.setPitch(targetPitch);
+                if (client.getNetworkHandler() != null) {
+                    client.getNetworkHandler().sendPacket(new net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket.LookAndOnGround(
+                            targetYaw, targetPitch, player.isOnGround(), player.horizontalCollision
+                    ));
+                }
+
+                ActionResult result = im.interactBlock(player, Hand.MAIN_HAND, hitResult);
+                if (result.isAccepted()) {
+                    player.swingHand(Hand.MAIN_HAND);
+                    return true;
+                }
+            }
+            return false;
+        }
+
         if (wouldPlacementIntersectPlayer(targetPos, state)) return false;
 
         // ── 1. Переключить хотбар на нужный блок ─────────────────────
@@ -87,13 +198,86 @@ public class BlockPlacer {
         }
 
         // ── 3. Установить блок через interactionManager ──────────────
+        // Snap player rotation to look exactly at the hit target to pass server-side angle validations
+        double dx = hitResult.getPos().x - player.getX();
+        double dy = hitResult.getPos().y - player.getEyeY();
+        double dz = hitResult.getPos().z - player.getZ();
+        double dxz = Math.sqrt(dx * dx + dz * dz);
+        float calculatedYaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+        float targetYaw = player.getYaw() + MathHelper.wrapDegrees(calculatedYaw - player.getYaw());
+
+        // Clamp targetYaw for block facing state:
+        // For StairsBlock, facing ALWAYS depends on player yaw (getPlayerFacing().getOpposite())!
+        // For other directional blocks (like trapdoors), player yaw clamp is only used when clicking top/bottom faces.
+        if (requiresPlacementFacing(state)) {
+            if (state.getBlock() instanceof StairsBlock || hitResult.getSide().getAxis().isVertical()) {
+                float desiredYaw = getPlacementYaw(state);
+                float diff = MathHelper.wrapDegrees(targetYaw - desiredYaw);
+                diff = MathHelper.clamp(diff, -44.0f, 44.0f);
+                targetYaw = desiredYaw + diff;
+            }
+        }
+
+        float targetPitch = (float) (-Math.toDegrees(Math.atan2(dy, dxz)));
+        targetPitch = MathHelper.clamp(targetPitch, -90.0f, 90.0f);
+
+        player.setYaw(targetYaw);
+        player.setPitch(targetPitch);
+        if (client.getNetworkHandler() != null) {
+            client.getNetworkHandler().sendPacket(new net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket.LookAndOnGround(
+                    targetYaw, targetPitch, player.isOnGround(), player.horizontalCollision
+            ));
+        }
+
+        boolean needSneak = isInteractableSupport(hitResult.getBlockPos());
+        if (needSneak && client.getNetworkHandler() != null) {
+            client.getNetworkHandler().sendPacket(new net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket(
+                    player, net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket.Mode.PRESS_SHIFT_KEY
+            ));
+        }
+
         ActionResult result = im.interactBlock(player, Hand.MAIN_HAND, hitResult);
+
+        if (needSneak && client.getNetworkHandler() != null) {
+            client.getNetworkHandler().sendPacket(new net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket(
+                    player, net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket.Mode.RELEASE_SHIFT_KEY
+            ));
+        }
+
+        if (!result.isAccepted()) {
+            if (player.getMainHandStack().getItem() instanceof net.minecraft.item.BucketItem) {
+                result = im.interactItem(player, Hand.MAIN_HAND);
+            }
+        }
         if (!result.isAccepted()) {
             return false;
         }
         player.swingHand(Hand.MAIN_HAND); // анимация руки
 
         return true;
+    }
+
+    private boolean isInteractableSupport(BlockPos pos) {
+        if (client.world == null) return false;
+        BlockState supportState = client.world.getBlockState(pos);
+        net.minecraft.block.Block b = supportState.getBlock();
+        return b instanceof net.minecraft.block.TrapdoorBlock
+                || b instanceof net.minecraft.block.DoorBlock
+                || b instanceof net.minecraft.block.FenceGateBlock
+                || b instanceof net.minecraft.block.ChestBlock
+                || b instanceof net.minecraft.block.EnderChestBlock
+                || b instanceof net.minecraft.block.BarrelBlock
+                || b instanceof net.minecraft.block.FurnaceBlock
+                || b instanceof net.minecraft.block.BlastFurnaceBlock
+                || b instanceof net.minecraft.block.SmokerBlock
+                || b instanceof net.minecraft.block.AnvilBlock
+                || b instanceof net.minecraft.block.CraftingTableBlock
+                || b instanceof net.minecraft.block.HopperBlock
+                || b instanceof net.minecraft.block.DispenserBlock
+                || b instanceof net.minecraft.block.DropperBlock
+                || b instanceof net.minecraft.block.ShulkerBoxBlock
+                || b instanceof net.minecraft.block.ButtonBlock
+                || b instanceof net.minecraft.block.LeverBlock;
     }
 
     /**
@@ -103,6 +287,12 @@ public class BlockPlacer {
         ClientPlayerEntity player = client.player;
         if (player == null) return false;
         ItemStack stack = player.getMainHandStack();
+        if (state.getBlock() == Blocks.WATER) {
+            return stack.isOf(net.minecraft.item.Items.WATER_BUCKET);
+        }
+        if (state.getBlock() == Blocks.LAVA) {
+            return stack.isOf(net.minecraft.item.Items.LAVA_BUCKET);
+        }
         return !stack.isEmpty() && stack.getItem() instanceof BlockItem blockItem && blockItem.getBlock() == state.getBlock();
     }
 
@@ -116,11 +306,24 @@ public class BlockPlacer {
         ClientPlayerEntity player = client.player;
         if (player == null) return false;
 
-        // ── 1. Ищем блок в 9 слотах хотбара ──────────────────────────
+        net.minecraft.item.Item expectedItem = null;
+        if (state.getBlock() == Blocks.WATER) {
+            expectedItem = net.minecraft.item.Items.WATER_BUCKET;
+        } else if (state.getBlock() == Blocks.LAVA) {
+            expectedItem = net.minecraft.item.Items.LAVA_BUCKET;
+        }
+
+        // ── 1. Ищем блок/ведро в 9 слотах хотбара ──────────────────────────
         for (int slot = 0; slot < 9; slot++) {
             ItemStack stack = player.getInventory().getStack(slot);
-            if (!stack.isEmpty() && stack.getItem() instanceof BlockItem blockItem) {
-                if (blockItem.getBlock() == state.getBlock()) {
+            if (!stack.isEmpty()) {
+                boolean match = false;
+                if (expectedItem != null) {
+                    match = stack.isOf(expectedItem);
+                } else if (stack.getItem() instanceof BlockItem blockItem) {
+                    match = blockItem.getBlock() == state.getBlock();
+                }
+                if (match) {
                     if (player.getInventory().selectedSlot != slot) {
                         selectSlot(slot);
                     }
@@ -130,6 +333,9 @@ public class BlockPlacer {
         }
 
         // ── 2. Блока нет → берём из Creative инвентаря ───────────────
+        if (expectedItem != null) {
+            return giveCreativeItem(expectedItem);
+        }
         return giveCreativeItem(state);
     }
 
@@ -156,11 +362,20 @@ public class BlockPlacer {
             return true;
         }
 
+        net.minecraft.item.Item expectedItem = null;
+        if (state.getBlock() == Blocks.WATER) {
+            expectedItem = net.minecraft.item.Items.WATER_BUCKET;
+        } else if (state.getBlock() == Blocks.LAVA) {
+            expectedItem = net.minecraft.item.Items.LAVA_BUCKET;
+        }
+
         for (int slot = 0; slot < 9; slot++) {
             ItemStack stack = player.getInventory().getStack(slot);
-            if (!stack.isEmpty() && stack.getItem() instanceof BlockItem blockItem) {
-                if (blockItem.getBlock() == state.getBlock()) {
-                    return true;
+            if (!stack.isEmpty()) {
+                if (expectedItem != null) {
+                    if (stack.isOf(expectedItem)) return true;
+                } else if (stack.getItem() instanceof BlockItem blockItem) {
+                    if (blockItem.getBlock() == state.getBlock()) return true;
                 }
             }
         }
@@ -172,33 +387,23 @@ public class BlockPlacer {
     // ════════════════════════════════════════════════════════════════════
 
     /**
-     * Кладёт нужный блок в хотбар через Creative-пакет.
-     *
-     * Использует {@code CreativeInventoryActionC2SPacket}, который
-     * сообщает серверу: «положить стак в слот N».
-     * Screen handler slot ID для хотбара: 36 + hotbar_slot.
-     *
-     * @return true если блок успешно положен в руку
+     * Кладёт нужный предмет в хотбар через Creative-пакет.
      */
-    private boolean giveCreativeItem(BlockState state) {
+    private boolean giveCreativeItem(net.minecraft.item.Item item) {
         ClientPlayerEntity player = client.player;
         if (player == null || !player.getAbilities().creativeMode) {
             return false;
         }
 
-        // Создаём стак нужного блока
-        ItemStack targetStack = new ItemStack(state.getBlock().asItem());
+        ItemStack targetStack = new ItemStack(item);
         if (targetStack.isEmpty()) {
-            return false; // блок без предмета (fire, и т.п.)
+            return false;
         }
 
-        // Полный стак (64 шт.)
         targetStack.setCount(targetStack.getMaxCount());
 
-        // Переключаемся на жертвенный слот с отправкой пакета на сервер
         selectSlot(CREATIVE_FILL_SLOT);
 
-        // Отправляем серверу пакет: slot 36+8 = 44 → хотбар слот 8
         int screenSlot = 36 + CREATIVE_FILL_SLOT;
         if (client.getNetworkHandler() != null) {
             client.getNetworkHandler().sendPacket(
@@ -206,10 +411,13 @@ public class BlockPlacer {
             );
         }
 
-        // Обновляем локально (чтобы не ждать ответа сервера)
         player.getInventory().setStack(CREATIVE_FILL_SLOT, targetStack);
 
         return true;
+    }
+
+    private boolean giveCreativeItem(BlockState state) {
+        return giveCreativeItem(state.getBlock().asItem());
     }
 
     /**
@@ -244,6 +452,7 @@ public class BlockPlacer {
         ClientPlayerInteractionManager im = client.interactionManager;
         if (player == null || im == null || client.world == null) return false;
         if (client.world.getBlockState(pos).isReplaceable()) return true;
+        if (!canSafelyBreak(pos)) return false;
 
         lastProbeObstruction = null;
         BlockHitResult hit = getBreakHitResult(player.getEyePos(), pos);
@@ -288,11 +497,19 @@ public class BlockPlacer {
                 RaycastContext.FluidHandling.NONE, client.player
         ));
         if (result.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
+                && result.getBlockPos().equals(pos)) {
+            return result;
+        }
+        if (result.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
                 && !result.getBlockPos().equals(pos)) {
             lastProbeObstruction = result.getBlockPos().toImmutable();
         }
-        return result.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
-                && result.getBlockPos().equals(pos) ? result : null;
+        // Fallback simulated hit if line of sight is blocked by floor blocks
+        Direction side = Direction.UP;
+        if (eyePos.y < pos.getY()) {
+            side = Direction.DOWN;
+        }
+        return new BlockHitResult(hitPoint, side, pos, false);
     }
 
     public void clearPlacementObstruction() {
@@ -316,11 +533,130 @@ public class BlockPlacer {
     }
 
     public boolean requiresPlacementFacing(BlockState state) {
-        return state.getBlock() instanceof StairsBlock && state.contains(Properties.HORIZONTAL_FACING);
+        return state.contains(Properties.HORIZONTAL_FACING);
     }
 
     public float getPlacementYaw(BlockState state) {
+        if (state.getBlock() instanceof net.minecraft.block.TrapdoorBlock && state.contains(Properties.HORIZONTAL_FACING)) {
+            return state.get(Properties.HORIZONTAL_FACING).getOpposite().getPositiveHorizontalDegrees();
+        }
         return state.get(Properties.HORIZONTAL_FACING).getPositiveHorizontalDegrees();
+    }
+
+    /** Keeps cinematic tools from rotating the camera just to orient stairs. */
+    public boolean isPlacementFacingSatisfied(BlockState state, float tolerance) {
+        if (!requiresPlacementFacing(state)) return true;
+        if (client.player == null) return false;
+        return Math.abs(MathHelper.wrapDegrees(
+                getPlacementYaw(state) - client.player.getYaw())) <= tolerance;
+    }
+
+    /**
+     * Returns false when removing {@code supportPos} would detach a neighboring
+     * crystal, torch, plant, hanging block, gravity block, or a modded block
+     * that expresses the same rule through {@code canPlaceAt}.
+     */
+    public boolean canSafelyBreak(BlockPos supportPos) {
+        return findDependentBlock(supportPos) == null;
+    }
+
+    public BlockPos getLastProtectedDependent() {
+        return lastProtectedDependent;
+    }
+
+    private boolean isSensitiveBlock(BlockState state) {
+        net.minecraft.block.Block block = state.getBlock();
+        String name = net.minecraft.registry.Registries.BLOCK.getId(block).getPath().toLowerCase();
+        return block instanceof net.minecraft.block.AmethystClusterBlock
+            || block instanceof net.minecraft.block.PointedDripstoneBlock
+            || block instanceof net.minecraft.block.TorchBlock
+            || block instanceof net.minecraft.block.FallingBlock
+            || name.contains("crystal")
+            || name.contains("bud")
+            || name.contains("cluster")
+            || name.contains("dripstone");
+    }
+
+    private BlockPos findDependentBlock(BlockPos supportPos) {
+        lastProtectedDependent = null;
+        if (client.world == null) return null;
+
+        WorldView withoutSupport = worldWithoutBlock(supportPos);
+        for (Direction direction : Direction.values()) {
+            BlockPos neighborPos = supportPos.offset(direction);
+            BlockState neighbor = client.world.getBlockState(neighborPos);
+            if (neighbor.isAir() || neighbor.isReplaceable()) continue;
+
+            if (isSensitiveBlock(neighbor)) {
+                boolean isAttached = false;
+                if (direction == Direction.UP) {
+                    isAttached = true;
+                } else if (neighbor.contains(Properties.FACING) && neighbor.get(Properties.FACING) == direction.getOpposite()) {
+                    isAttached = true;
+                } else if (neighbor.contains(Properties.HORIZONTAL_FACING) && neighbor.get(Properties.HORIZONTAL_FACING) == direction.getOpposite()) {
+                    isAttached = true;
+                }
+                if (isAttached) {
+                    lastProtectedDependent = neighborPos.toImmutable();
+                    return lastProtectedDependent;
+                }
+            }
+
+            if (direction == Direction.UP && neighbor.getBlock() instanceof FallingBlock) {
+                lastProtectedDependent = neighborPos.toImmutable();
+                return lastProtectedDependent;
+            }
+
+            try {
+                boolean currentlyStable = neighbor.canPlaceAt(client.world, neighborPos);
+                boolean stableWithoutSupport = neighbor.canPlaceAt(withoutSupport, neighborPos);
+                if (currentlyStable && !stableWithoutSupport) {
+                    lastProtectedDependent = neighborPos.toImmutable();
+                    return lastProtectedDependent;
+                }
+            } catch (RuntimeException exception) {
+                // A modded support rule that cannot be simulated is treated
+                // conservatively: preserving the neighbor is safer than deleting it.
+                HumanBuilderMod.LOGGER.warn(
+                        "[HumanBuilder] Could not simulate support removal at {} for {}; protecting it",
+                        supportPos.toShortString(), neighborPos.toShortString(), exception);
+                lastProtectedDependent = neighborPos.toImmutable();
+                return lastProtectedDependent;
+            }
+        }
+        return null;
+    }
+
+    private WorldView worldWithoutBlock(BlockPos removedPos) {
+        return (WorldView) Proxy.newProxyInstance(
+                WorldView.class.getClassLoader(),
+                new Class<?>[] { WorldView.class },
+                (proxy, method, args) -> {
+                    if ("getBlockState".equals(method.getName())
+                            && args != null && args.length == 1
+                            && removedPos.equals(args[0])) {
+                        return Blocks.AIR.getDefaultState();
+                    }
+                    if ("getFluidState".equals(method.getName())
+                            && args != null && args.length == 1
+                            && removedPos.equals(args[0])) {
+                        return Fluids.EMPTY.getDefaultState();
+                    }
+                    if (method.getDeclaringClass() == Object.class) {
+                        return switch (method.getName()) {
+                            case "toString" -> "WorldViewWithout(" + removedPos.toShortString() + ")";
+                            case "hashCode" -> System.identityHashCode(proxy);
+                            case "equals" -> proxy == args[0];
+                            default -> method.invoke(this, args);
+                        };
+                    }
+                    try {
+                        return method.invoke(client.world, args);
+                    } catch (InvocationTargetException exception) {
+                        throw exception.getCause();
+                    }
+                }
+        );
     }
 
     /** States in one movement batch must not require a different placement gesture. */
@@ -338,39 +674,91 @@ public class BlockPlacer {
 
     /** True when the desired block's real collision shape overlaps the player. */
     public boolean wouldPlacementIntersectPlayer(BlockPos targetPos, BlockState state) {
-        if (client.player == null || client.world == null) return false;
-        Box playerBox = client.player.getBoundingBox();
+        if (client.player == null) return false;
+        return wouldPlacementIntersectBox(targetPos, state, client.player.getBoundingBox());
+    }
+
+    public boolean wouldPlacementIntersectBox(BlockPos targetPos, BlockState state, Box box) {
+        if (client.world == null) return false;
         VoxelShape collision = state.getCollisionShape(client.world, targetPos);
         for (Box localBox : collision.getBoundingBoxes()) {
             Box worldBox = localBox.offset(
                     targetPos.getX(), targetPos.getY(), targetPos.getZ());
-            if (playerBox.intersects(worldBox)) return true;
+            if (box.intersects(worldBox)) return true;
         }
         return false;
     }
 
     /** Compares properties that are directly controlled during placement. */
     public boolean matchesPlacementState(BlockState actual, BlockState desired) {
-        if (actual.getBlock() != desired.getBlock()) return false;
-        if (desired.getBlock() instanceof StairsBlock) {
-            return actual.get(Properties.HORIZONTAL_FACING) == desired.get(Properties.HORIZONTAL_FACING)
-                    && actual.get(Properties.BLOCK_HALF) == desired.get(Properties.BLOCK_HALF);
+        if (actual.getBlock() != desired.getBlock()) {
+            if (desired.getBlock() == Blocks.DIRT
+                    && (actual.getBlock() == Blocks.GRASS_BLOCK
+                    || actual.getBlock() == Blocks.MYCELIUM)) {
+                return true;
+            }
+            return false;
         }
-        if (desired.getBlock() instanceof SlabBlock) {
-            return actual.get(Properties.SLAB_TYPE) == desired.get(Properties.SLAB_TYPE);
+        if (!managedPropertiesMatch(actual, desired, false)) return false;
+        return !isManuallyToggleable(desired)
+                || actual.get(Properties.OPEN) == desired.get(Properties.OPEN);
+    }
+
+    public boolean canCompletePlacementState(BlockState actual, BlockState desired) {
+        if (desired.getBlock() instanceof SlabBlock
+                && actual.getBlock() == desired.getBlock()
+                && desired.get(Properties.SLAB_TYPE) == SlabType.DOUBLE
+                && actual.get(Properties.SLAB_TYPE) != SlabType.DOUBLE) {
+            return true;
+        }
+
+        return canToggleOpenState(actual, desired);
+    }
+
+    public boolean requiresPlacementVerification(BlockState state) {
+        return state.getBlock() instanceof StairsBlock
+                || state.getBlock() instanceof SlabBlock
+                || hasManagedState(state)
+                || isManuallyToggleable(state);
+    }
+
+    private boolean hasManagedState(BlockState state) {
+        for (Property<?> property : state.getEntries().keySet()) {
+            if (MANAGED_STATE_PROPERTIES.contains(property.getName())) return true;
+        }
+        return false;
+    }
+
+    private boolean managedPropertiesMatch(
+            BlockState actual,
+            BlockState desired,
+            boolean ignoreOpen
+    ) {
+        Map<Property<?>, Comparable<?>> actualEntries = actual.getEntries();
+        for (Map.Entry<Property<?>, Comparable<?>> entry : desired.getEntries().entrySet()) {
+            String name = entry.getKey().getName();
+            if (!MANAGED_STATE_PROPERTIES.contains(name)) continue;
+            if (ignoreOpen && "open".equals(name)) continue;
+            if (!Objects.equals(actualEntries.get(entry.getKey()), entry.getValue())) return false;
         }
         return true;
     }
 
-    public boolean canCompletePlacementState(BlockState actual, BlockState desired) {
-        return desired.getBlock() instanceof SlabBlock
-                && actual.getBlock() == desired.getBlock()
-                && desired.get(Properties.SLAB_TYPE) == SlabType.DOUBLE
-                && actual.get(Properties.SLAB_TYPE) != SlabType.DOUBLE;
+    private boolean isManuallyToggleable(BlockState state) {
+        if (!state.contains(Properties.OPEN)) return false;
+        net.minecraft.block.Block block = state.getBlock();
+        if (block == Blocks.IRON_TRAPDOOR || block == Blocks.IRON_DOOR) return false;
+        return block instanceof net.minecraft.block.TrapdoorBlock
+                || block instanceof net.minecraft.block.DoorBlock
+                || block instanceof net.minecraft.block.FenceGateBlock;
     }
 
-    public boolean requiresPlacementVerification(BlockState state) {
-        return state.getBlock() instanceof StairsBlock || state.getBlock() instanceof SlabBlock;
+    private boolean canToggleOpenState(BlockState actual, BlockState desired) {
+        return actual.getBlock() == desired.getBlock()
+                && isManuallyToggleable(actual)
+                && isManuallyToggleable(desired)
+                && managedPropertiesMatch(actual, desired, true)
+                && actual.get(Properties.OPEN) != desired.get(Properties.OPEN);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -398,28 +786,42 @@ public class BlockPlacer {
                                                boolean recordPlacementObstruction) {
         if (client.world == null || client.player == null) return null;
 
+        BlockState currentState = client.world.getBlockState(targetPos);
+        if (canToggleOpenState(currentState, state)) {
+            return findToggleTarget(targetPos, currentState, eyePos);
+        }
+
         BlockHitResult slabMerge = findSlabMergeTarget(eyePos, targetPos, state);
         if (slabMerge != null) return slabMerge;
 
-        for (Direction dir : FACE_PRIORITY) {
+        BlockHitResult fallback = null;
+        for (Direction dir : getFacePriority(state)) {
             // Блок в направлении dir от цели (потенциальная опора)
             BlockPos supportPos = targetPos.offset(dir);
 
             BlockState supportState = client.world.getBlockState(supportPos);
 
+            boolean isSolid = !supportState.isAir() && !supportState.isReplaceable();
+            boolean isRecentlyPlaced = isPlacedSchematicSupport(supportPos);
+
             // Проверяем, что опорный блок реально может принять клик.
-            if (supportState.isAir() || supportState.isReplaceable()) continue;
+            if (!isSolid && !isRecentlyPlaced) continue;
 
             // Грань опорного блока, на которую кликаем:
             // это грань, смотрящая ОТ опорного блока К целевому
             Direction clickFace = dir.getOpposite();
 
             VoxelShape shape = supportState.getOutlineShape(client.world, supportPos);
-            for (Box box : shape.getBoundingBoxes()) {
+            List<Box> boxes = shape.isEmpty() ? List.of(new Box(0, 0, 0, 1, 1, 1)) : shape.getBoundingBoxes();
+            for (Box box : boxes) {
                 Vec3d hitVec = faceCenter(supportPos, box, clickFace);
                 hitVec = adjustHitForState(hitVec, box, supportPos, targetPos, clickFace, state);
                 if (!producesDesiredHalf(hitVec, targetPos, clickFace, state)) continue;
                 if (eyePos.distanceTo(hitVec) > 4.5) continue;
+
+                if (fallback == null) {
+                    fallback = new BlockHitResult(hitVec, clickFace, supportPos, false);
+                }
 
                 // Move the ray endpoint just inside the shape. Ending exactly on
                 // a face intermittently produces MISS because of floating point rounding.
@@ -449,7 +851,10 @@ public class BlockPlacer {
             }
         }
 
-        return null; // Нет подходящей опоры
+        if (lineOfSightRequired) {
+            return null;
+        }
+        return fallback; // Нет подходящей опоры
     }
 
     private Vec3d faceCenter(BlockPos pos, Box box, Direction face) {
@@ -501,6 +906,9 @@ public class BlockPlacer {
             SlabType type = state.get(Properties.SLAB_TYPE);
             if (type != SlabType.DOUBLE) return type == SlabType.TOP;
         }
+        if (state.getBlock() instanceof net.minecraft.block.TrapdoorBlock && state.contains(net.minecraft.block.TrapdoorBlock.HALF)) {
+            return state.get(net.minecraft.block.TrapdoorBlock.HALF) == net.minecraft.block.enums.BlockHalf.TOP;
+        }
         return null;
     }
 
@@ -529,12 +937,49 @@ public class BlockPlacer {
                     eyePos, rayEnd, RaycastContext.ShapeType.OUTLINE,
                     RaycastContext.FluidHandling.NONE, client.player
             ));
-            if (result.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
-                    && result.getBlockPos().equals(targetPos)
-                    && result.getSide() == clickFace) {
-                return new BlockHitResult(result.getPos(), clickFace, targetPos, false);
+        }
+        return null;
+    }
+
+    private BlockHitResult findToggleTarget(
+            BlockPos targetPos,
+            BlockState currentState,
+            Vec3d eyePos
+    ) {
+        if (client.world == null || client.player == null) return null;
+        VoxelShape shape = currentState.getOutlineShape(client.world, targetPos);
+
+        Direction bestSide = null;
+        Vec3d bestHit = null;
+        double bestDist = Double.MAX_VALUE;
+
+        for (Box box : shape.getBoundingBoxes()) {
+            for (Direction side : Direction.values()) {
+                Vec3d center = faceCenter(targetPos, box, side);
+                double dist = eyePos.distanceTo(center);
+                if (dist > 4.5 || dist >= bestDist) continue;
+                Vec3d rayEnd = center.add(
+                        -side.getOffsetX() * 0.01,
+                        -side.getOffsetY() * 0.01,
+                        -side.getOffsetZ() * 0.01
+                );
+                BlockHitResult ray = client.world.raycast(new RaycastContext(
+                        eyePos, rayEnd, RaycastContext.ShapeType.OUTLINE,
+                        RaycastContext.FluidHandling.NONE, client.player
+                ));
+                if (ray.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
+                        && ray.getBlockPos().equals(targetPos)) {
+                    bestDist = dist;
+                    bestHit = ray.getPos();
+                    bestSide = ray.getSide();
+                }
             }
         }
+
+        if (bestHit != null && bestSide != null) {
+            return new BlockHitResult(bestHit, bestSide, targetPos, false);
+        }
+
         return null;
     }
 }

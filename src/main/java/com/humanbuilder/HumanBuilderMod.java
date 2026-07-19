@@ -55,8 +55,16 @@ public class HumanBuilderMod implements ClientModInitializer {
         movement = new MovementController(client, camera, placer);
         executor = new BuildExecutor(client, camera, movement, placer, timing);
 
+        openGuiKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.human-builder.open_gui",
+                InputUtil.Type.KEYSYM,
+                GLFW.GLFW_KEY_H,
+                "key.category.human-builder"
+        ));
+
         // ── Рендерер голограммы ──────────────────────────────────────
-        com.humanbuilder.renderer.SchematicRenderer renderer = new com.humanbuilder.renderer.SchematicRenderer(executor);
+        com.humanbuilder.renderer.SchematicRenderer renderer =
+                new com.humanbuilder.renderer.SchematicRenderer(executor);
         renderer.register();
 
         // ── Обработчик тиков ─────────────────────────────────────────
@@ -64,12 +72,6 @@ public class HumanBuilderMod implements ClientModInitializer {
 
         ClientTickEvents.END_CLIENT_TICK.register(tickHandler::onEndTick);
 
-        openGuiKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
-                "key.human-builder.open_gui",
-                InputUtil.Type.KEYSYM,
-                GLFW.GLFW_KEY_H,
-                "key.category.human-builder"
-        ));
         ClientTickEvents.END_CLIENT_TICK.register(currentClient -> {
             while (openGuiKey.wasPressed()) {
                 if (currentClient.currentScreen == null) {

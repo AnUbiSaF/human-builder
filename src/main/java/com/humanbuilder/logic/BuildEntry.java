@@ -10,12 +10,24 @@ import net.minecraft.util.math.BlockPos;
  * @param pos       координаты в мире, куда нужно поставить блок
  * @param state     тип и состояние блока (включая rotation, facing и т.д.)
  * @param category  логическая категория (фундамент, стена, крыша…)
+ * @param workGroup фасадный участок, который executor завершает атомарно
+ * @param temporary служебная опора вне схемы, не входящая в прогресс
  */
 public record BuildEntry(
         BlockPos pos,
         BlockState state,
-        BlockCategory category
+        BlockCategory category,
+        int workGroup,
+        boolean temporary
 ) {
+    public BuildEntry(BlockPos pos, BlockState state, BlockCategory category) {
+        this(pos, state, category, 0, false);
+    }
+
+    public BuildEntry(BlockPos pos, BlockState state, BlockCategory category, int workGroup) {
+        this(pos, state, category, workGroup, false);
+    }
+
     /**
      * Расстояние (Manhattan) до другой позиции.
      * Используется для nearest-neighbor сортировки.

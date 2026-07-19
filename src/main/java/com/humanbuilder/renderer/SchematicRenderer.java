@@ -13,12 +13,9 @@ import net.minecraft.util.math.Vec3d;
 import java.util.List;
 
 /**
-20:  * Рендерер голограммы схемы.
-21:  *
-22:  * Подписывается на событие WorldRenderEvents.LAST и рисует
-23:  * полупрозрачные цветные кубы для всех ещё не построенных блоков схемы
-24:  * в радиусе 16 блоков от игрока.
-25:  */
+ * Рендерер голограммы схемы и интерактивных векторных инструментов.
+ * Показывает только ближайшие позиции, чтобы большие фасады не снижали FPS.
+ */
 public class SchematicRenderer {
 
     private static final int RENDER_RADIUS = 16;
@@ -42,8 +39,7 @@ public class SchematicRenderer {
 
     private void render(WorldRenderContext context) {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player == null || client.world == null || !executor.isActive()
-                || !executor.isHologramVisible()) {
+        if (client.player == null || client.world == null) {
             visibleCache = List.of();
             return;
         }
@@ -51,10 +47,16 @@ public class SchematicRenderer {
         Vec3d cameraPos = context.camera().getPos();
         BlockPos playerPos = client.player.getBlockPos();
         long now = System.nanoTime();
-        if (now >= nextCacheRefresh) {
+        boolean schematicVisible = executor.isActive() && executor.isHologramVisible();
+        if (schematicVisible && now >= nextCacheRefresh) {
             visibleCache = executor.getVisibleEntries(
                     playerPos, RENDER_RADIUS, MAX_RENDERED_BLOCKS);
             nextCacheRefresh = now + CACHE_INTERVAL_NANOS;
+        } else if (!schematicVisible) {
+            visibleCache = List.of();
+        }
+        if (visibleCache.isEmpty()) {
+            return;
         }
 
         MatrixStack matrices = context.matrixStack();
@@ -74,12 +76,19 @@ public class SchematicRenderer {
                     r = 0.0f; g = 0.4f; b = 1.0f; // глубокий синий
                     break;
                 case WALL:
-                case INTERIOR_WALL:
                     r = 0.0f; g = 0.8f; b = 0.2f; // зеленый
                     break;
-                case FLOOR:
-                case CEILING:
-                    r = 1.0f; g = 0.7f; b = 0.0f; // оранжевый
+                case PILLAR:
+                    r = 1.0f; g = 0.72f; b = 0.15f;
+                    break;
+                case ROOF:
+                    r = 0.95f; g = 0.42f; b = 0.12f;
+                    break;
+                case WINDOW:
+                    r = 0.2f; g = 0.65f; b = 1.0f;
+                    break;
+                case INTERIOR_WALL:
+                    r = 0.0f; g = 0.8f; b = 0.8f; // бирюзовый
                     break;
                 case DECOR:
                     r = 0.9f; g = 0.1f; b = 0.8f; // фиолетовый
@@ -88,6 +97,7 @@ public class SchematicRenderer {
 
             drawHologramBox(matrices, consumers, pos, cameraPos, r, g, b, 0.25f);
         }
+
     }
 
     private void drawHologramBox(

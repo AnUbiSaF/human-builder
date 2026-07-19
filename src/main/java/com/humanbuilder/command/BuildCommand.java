@@ -110,33 +110,20 @@ public class BuildCommand {
                             )
                         )
                     )
-                    // /humanbuilder mode [default|mixed|layered|realistic]
+                    // /humanbuilder mode [layered|architectural]
                     .then(ClientCommandManager.literal("mode")
-                        .then(ClientCommandManager.literal("default")
-                            .executes(ctx -> {
-                                executor.setSortMode(com.humanbuilder.logic.SortMode.DEFAULT);
-                                ctx.getSource().sendFeedback(Text.literal("§a[HB] Режим сортировки изменен на классический: §eDEFAULT"));
-                                return 1;
-                            })
-                        )
-                        .then(ClientCommandManager.literal("mixed")
-                            .executes(ctx -> {
-                                executor.setSortMode(com.humanbuilder.logic.SortMode.MIXED);
-                                ctx.getSource().sendFeedback(Text.literal("§a[HB] Режим сортировки изменен на послойный: §eMIXED"));
-                                return 1;
-                            })
-                        )
                         .then(ClientCommandManager.literal("layered")
                             .executes(ctx -> {
                                 executor.setSortMode(com.humanbuilder.logic.SortMode.LAYERED);
-                                ctx.getSource().sendFeedback(Text.literal("§a[HB] Режим сортировки: §eстрого по слоям снизу вверх"));
+                                ctx.getSource().sendFeedback(Text.literal("§a[HB] Режим: §eпо слоям снизу вверх"));
                                 return 1;
                             })
                         )
-                        .then(ClientCommandManager.literal("realistic")
+                        .then(ClientCommandManager.literal("architectural")
                             .executes(ctx -> {
-                                executor.setSortMode(com.humanbuilder.logic.SortMode.REALISTIC);
-                                ctx.getSource().sendFeedback(Text.literal("§a[HB] Режим сортировки: §eлогичные серии с учетом опор"));
+                                executor.setSortMode(com.humanbuilder.logic.SortMode.ARCHITECTURAL);
+                                ctx.getSource().sendFeedback(Text.literal(
+                                        "§a[HB] Режим: §eконтур → каркас → заполнение → детали"));
                                 return 1;
                             })
                         )
@@ -265,12 +252,15 @@ public class BuildCommand {
     }
 
     private static int executeStop(FabricClientCommandSource source) {
-        if (!executor.isActive()) {
+        boolean stopped = false;
+        if (executor.isActive()) {
+            executor.stopBuild();
+            stopped = true;
+        }
+        if (!stopped) {
             source.sendFeedback(Text.literal("§e[HB] Строительство не запущено."));
             return 0;
         }
-
-        executor.stopBuild();
         return 1;
     }
 

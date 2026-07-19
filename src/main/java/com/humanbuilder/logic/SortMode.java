@@ -1,20 +1,9 @@
 package com.humanbuilder.logic;
 
-/**
- * Режимы сортировки блоков схемы.
- */
+/** Available autonomous construction orders. */
 public enum SortMode {
-    /** Классический режим по категориям (сначала фундамент, затем стены, затем полы, и т.д. по всей высоте) */
-    DEFAULT("Классический"),
-
-    /** Смешанный режим по слоям (первый слой целиком, затем стены всех этажей, затем заполнение) */
-    MIXED("Смешанный"),
-
-    /** Строгий режим: полностью завершает каждый Y-слой перед переходом выше. */
     LAYERED("По слоям"),
-
-    /** Последовательные рабочие серии с учетом опор и состояния блоков. */
-    REALISTIC("Реалистичный");
+    ARCHITECTURAL("Архитектурный таймлапс");
 
     private final String displayName;
 
@@ -24,5 +13,9 @@ public enum SortMode {
 
     public String getDisplayName() {
         return displayName;
+    }
+
+    public boolean isCinematic() {
+        return this == ARCHITECTURAL;
     }
 }

@@ -23,7 +23,6 @@ import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.function.Predicate;
-import java.util.function.Predicate;
 
 /**
  * Moves the player using normal movement keys and collision-aware paths.
@@ -32,9 +31,12 @@ import java.util.function.Predicate;
  */
 public class MovementController {
 
-    private static final double REACH_DISTANCE = 4.45;
+    private static final double REACH_DISTANCE = 4.3;
     private static final double WAYPOINT_DISTANCE = 0.32;
     private static final double FINAL_DISTANCE = 0.20;
+    private static final double FLIGHT_FINAL_HORIZONTAL_DISTANCE = 0.12;
+    private static final double FLIGHT_FINAL_VERTICAL_DISTANCE = 0.08;
+    private static final double BUILD_CLEARANCE_MARGIN = 0.08;
     private static final double FLIGHT_CRUISE_SPEED = 0.48;
     private static final double FLIGHT_ACCELERATION = 0.16;
     private static final int MAX_GROUND_NODES = 5_000;
@@ -60,7 +62,8 @@ public class MovementController {
     private boolean flyingRoute;
     private int noProgressTicks;
     private int blockedEndpointTicks;
-    private int replanAttempts;
+    private int planningAttempts;
+    private int noProgressReplans;
     private final Set<BlockPos> attemptedStandingPositions = new HashSet<>();
     private double bestWaypointDistance = Double.MAX_VALUE;
     private Boolean flyingBeforeControl;
@@ -72,11 +75,21 @@ public class MovementController {
     private boolean planningPending;
     private int planningHoldTicks;
     private Predicate<BlockPos> reservedBuildPosition = ignored -> false;
+    private boolean cinematicMode;
+    private boolean cinematicFast = true;
 
     public MovementController(MinecraftClient client, CameraSmoother camera, BlockPlacer placer) {
         this.client = client;
         this.camera = camera;
         this.placer = placer;
+    }
+
+    public void setCinematicMode(boolean cinematicMode) {
+        this.cinematicMode = cinematicMode;
+    }
+
+    public void setCinematicFast(boolean cinematicFast) {
+        this.cinematicFast = cinematicFast;
     }
 
     public void setReservedBuildPositionPredicate(Predicate<BlockPos> predicate) {
@@ -99,6 +112,25 @@ public class MovementController {
         return navigateTo(target, null, retryingSameTarget);
     }
 
+    private boolean isFlightPathClear(Vec3d start, Vec3d end) {
+        if (client.world == null || client.player == null) return false;
+        net.minecraft.world.RaycastContext contextHead = new net.minecraft.world.RaycastContext(
+            start.add(0, 1.6, 0), end.add(0, 1.6, 0),
+            net.minecraft.world.RaycastContext.ShapeType.COLLIDER,
+            net.minecraft.world.RaycastContext.FluidHandling.NONE,
+            client.player
+        );
+        net.minecraft.world.RaycastContext contextFeet = new net.minecraft.world.RaycastContext(
+            start.add(0, 0.1, 0), end.add(0, 0.1, 0),
+            net.minecraft.world.RaycastContext.ShapeType.COLLIDER,
+            net.minecraft.world.RaycastContext.FluidHandling.NONE,
+            client.player
+        );
+        boolean headClear = client.world.raycast(contextHead).getType() == net.minecraft.util.hit.HitResult.Type.MISS;
+        boolean feetClear = client.world.raycast(contextFeet).getType() == net.minecraft.util.hit.HitResult.Type.MISS;
+        return headClear && feetClear;
+    }
+
     private boolean navigateTo(BlockPos target, BlockState state, boolean forceDifferent) {
         if (client.player == null || client.world == null) {
             failRoute("игрок или мир недоступен");
@@ -110,22 +142,46 @@ public class MovementController {
                 && java.util.Objects.equals(targetBlockState, state);
         if (!continuingSameTarget) {
             attemptedStandingPositions.clear();
+            noProgressReplans = 0;
         } else if (standingTarget != null) {
             attemptedStandingPositions.add(BlockPos.ofFloored(standingTarget));
         }
+        planningAttempts = 0;
 
         routeFailed = false;
         routeArrived = false;
         failureReason = null;
         blockingObstacle = null;
+        targetBlockPos = target.toImmutable();
+        targetBlockState = state;
+
+        if (cinematicMode && active && flyingRoute) {
+            Vec3d newStandingTarget = findStandingPosition(targetBlockPos, forceDifferent);
+            if (newStandingTarget != null) {
+                double dist = client.player.getPos().distanceTo(newStandingTarget);
+                if (dist < 8.0 && isFlightPathClear(client.player.getPos(), newStandingTarget)) {
+                    standingTarget = newStandingTarget;
+                    waypoints.clear();
+                    waypoints.add(standingTarget);
+                    waypointIndex = 0;
+                    planningPending = false;
+                    planningHoldTicks = 0;
+                    bestWaypointDistance = Double.MAX_VALUE;
+                    noProgressTicks = 0;
+                    blockedEndpointTicks = 0;
+                    routeFailed = false;
+                    routeArrived = false;
+                    return true;
+                }
+            }
+        }
+
         holdStillForPlanning();
 
         if (flyingBeforeControl == null) {
             flyingBeforeControl = client.player.getAbilities().flying;
         }
 
-        targetBlockPos = target.toImmutable();
-        targetBlockState = state;
         placer.clearPlacementObstruction();
         placer.clearProbeObstruction();
         standingTarget = findStandingPosition(targetBlockPos, forceDifferent);
@@ -137,7 +193,6 @@ public class MovementController {
         }
         noProgressTicks = 0;
         blockedEndpointTicks = 0;
-        replanAttempts = 0;
         scheduleRoutePlanning(1);
         return true;
     }
@@ -150,6 +205,13 @@ public class MovementController {
             if (planningHoldTicks-- > 0) return;
 
             planningPending = false;
+            if (canUseCreativeFlight()
+                    && !isStandingTargetAvailable()
+                    && !selectAlternativeStandingTarget()) {
+                active = false;
+                failRoute("конечная позиция маршрута занята новым блоком");
+                return;
+            }
             long planningStarted = System.nanoTime();
             boolean routePlanned = planRoute();
             long planningMillis = (System.nanoTime() - planningStarted) / 1_000_000L;
@@ -158,13 +220,33 @@ public class MovementController {
                         targetBlockPos.toShortString(), planningMillis);
             }
             if (!routePlanned) {
+                if (planningAttempts < 3 && selectAlternativeStandingTarget()) {
+                    planningAttempts++;
+                    HumanBuilderMod.LOGGER.debug(
+                            "[HumanBuilder] Route to {} rejected; trying standing point #{}",
+                            targetBlockPos.toShortString(), planningAttempts + 1);
+                    scheduleRoutePlanning(1);
+                    return;
+                }
                 active = false;
-                failRoute("безопасный маршрут к позиции не найден");
+                failRoute("безопасный маршрут не найден ни к одной доступной точке установки");
             }
             return;
         }
 
         ClientPlayerEntity player = client.player;
+        if (flyingRoute && !isStandingTargetAvailable()) {
+            HumanBuilderMod.LOGGER.info(
+                    "[HumanBuilder] Standing point for {} became occupied; selecting another",
+                    targetBlockPos == null ? "unknown" : targetBlockPos.toShortString());
+            if (!selectAlternativeStandingTarget()) {
+                active = false;
+                failRoute("конечная позиция маршрута занята новым блоком");
+                return;
+            }
+            scheduleRoutePlanning(1);
+            return;
+        }
         advanceReachedWaypoints(player.getPos());
 
         if (isBlockedAtFinalApproach(player.getPos())) {
@@ -214,7 +296,22 @@ public class MovementController {
             // Camera is a placement tool, not a steering wheel. Keeping it out
             // of the flight feedback loop prevents delayed 180-degree turns
             // from turning a small overshoot into an endless orbit.
-            camera.stop();
+            if (!cinematicMode) {
+                camera.stop();
+            } else if (!cinematicFast) {
+                // В человечном кинематографическом режиме, если камера не занята установкой блока,
+                // плавно смотрим по направлению полета к следующему вейпоинту.
+                if (!camera.isActive()) {
+                    if (horizontalDistance > 0.08) {
+                        double lookDistance = Math.min(4.0, horizontalDistance);
+                        camera.lookAt(
+                                playerPos.x + dx / horizontalDistance * lookDistance,
+                                player.getEyeY() + (waypoint.y - playerPos.y) * 0.5,
+                                playerPos.z + dz / horizontalDistance * lookDistance
+                        );
+                    }
+                }
+            }
             applyFlightVelocity(player, waypoint, horizontalDistance);
         } else {
             if (horizontalDistance > 0.08) {
@@ -255,11 +352,39 @@ public class MovementController {
         boolean interactionReady = finalWaypoint && targetBlockPos != null
                 && canInteractFromCurrentPosition();
 
-        double speedLimit = finalWaypoint ? 0.38 : FLIGHT_CRUISE_SPEED;
-        double horizontalSpeed = Math.min(speedLimit, horizontalDistance * 0.48);
-        double horizontalStopDistance = interactionReady ? 0.30 : (finalWaypoint ? 0.008 : 0.20);
-        if (horizontalDistance < horizontalStopDistance) {
-            horizontalSpeed = 0.0;
+        double speedLimit;
+        double horizontalSpeed;
+        double desiredY;
+        double verticalStopDistance;
+        double acceleration;
+
+        double dy = waypoint.y - player.getY();
+
+        if (cinematicMode) {
+            if (cinematicFast) {
+                speedLimit = FLIGHT_CRUISE_SPEED;
+                horizontalSpeed = finalWaypoint
+                        ? Math.min(speedLimit, horizontalDistance * 0.55)
+                        : speedLimit;
+                desiredY = MathHelper.clamp(dy * 0.42, -0.40, 0.40);
+                verticalStopDistance = 0.0;
+                acceleration = FLIGHT_ACCELERATION;
+            } else {
+                // Humanized Cinematic Mode (Smooth)
+                double maxCruiseSpeed = FLIGHT_CRUISE_SPEED * 0.7;
+                speedLimit = finalWaypoint ? 0.30 : maxCruiseSpeed;
+                horizontalSpeed = Math.min(speedLimit, horizontalDistance * 0.38);
+                desiredY = MathHelper.clamp(dy * 0.35, -0.25, 0.25);
+                verticalStopDistance = finalWaypoint ? 0.012 : 0.18;
+                acceleration = interactionReady ? 0.08 : FLIGHT_ACCELERATION * 0.6;
+            }
+        } else {
+            // Normal (Non-cinematic) Flight
+            speedLimit = finalWaypoint ? 0.38 : FLIGHT_CRUISE_SPEED;
+            horizontalSpeed = Math.min(speedLimit, horizontalDistance * 0.48);
+            desiredY = MathHelper.clamp(dy * 0.42, -0.40, 0.40);
+            verticalStopDistance = finalWaypoint ? 0.012 : 0.18;
+            acceleration = interactionReady ? 0.24 : FLIGHT_ACCELERATION;
         }
 
         double desiredX = horizontalDistance > 0.001
@@ -269,14 +394,10 @@ public class MovementController {
                 ? (waypoint.z - player.getZ()) / horizontalDistance * horizontalSpeed
                 : 0.0;
 
-        double dy = waypoint.y - player.getY();
-        double desiredY = MathHelper.clamp(dy * 0.42, -0.40, 0.40);
-        double verticalStopDistance = interactionReady ? 0.48 : (finalWaypoint ? 0.012 : 0.18);
         if (Math.abs(dy) < verticalStopDistance) {
             desiredY = 0.0;
         }
 
-        double acceleration = interactionReady ? 0.24 : FLIGHT_ACCELERATION;
         player.setVelocity(
                 approach(currentVelocity.x, desiredX, acceleration),
                 approach(currentVelocity.y, desiredY, acceleration),
@@ -296,23 +417,30 @@ public class MovementController {
             Vec3d waypoint = waypoints.get(waypointIndex);
             double horizontal = Math.hypot(waypoint.x - playerPos.x, waypoint.z - playerPos.z);
             double vertical = Math.abs(waypoint.y - playerPos.y);
-            double threshold = waypointIndex == waypoints.size() - 1
-                    ? (flyingRoute ? 0.40 : FINAL_DISTANCE)
-                    : (flyingRoute ? 0.58 : WAYPOINT_DISTANCE);
-            double verticalThreshold = flyingRoute ? 0.55 : 1.15;
+            boolean finalWaypoint = waypointIndex == waypoints.size() - 1;
+            double threshold = flyingRoute
+                    ? (cinematicMode ? (cinematicFast ? 0.95 : 0.58) : 0.58)
+                    : (finalWaypoint ? FINAL_DISTANCE : WAYPOINT_DISTANCE);
+            double verticalThreshold = flyingRoute
+                    ? (cinematicMode ? (cinematicFast ? 0.95 : 0.55) : 0.55)
+                    : 1.15;
             double distance = playerPos.distanceTo(waypoint);
             boolean passedFlightWaypoint = flyingRoute
-                    && waypointIndex < waypoints.size() - 1
-                    && bestWaypointDistance < 0.85
+                    && !finalWaypoint
+                    && bestWaypointDistance < (cinematicMode ? (cinematicFast ? 1.25 : 0.85) : 0.85)
                     && distance > bestWaypointDistance + 0.18;
-            if (!passedFlightWaypoint && (horizontal > threshold || vertical > verticalThreshold)) break;
-            if (waypointIndex == waypoints.size() - 1
+            boolean reachedWaypoint = flyingRoute && finalWaypoint
+                    ? isWithinPreciseFlightEndpoint(horizontal, vertical)
+                    : horizontal <= threshold && vertical <= verticalThreshold;
+            if (!passedFlightWaypoint && !reachedWaypoint) break;
+            if (finalWaypoint
                     && targetBlockPos != null
                     && !canInteractFromCurrentPosition()) break;
 
             waypointIndex++;
             bestWaypointDistance = Double.MAX_VALUE;
             noProgressTicks = 0;
+            noProgressReplans = 0;
         }
     }
 
@@ -328,7 +456,12 @@ public class MovementController {
     private void handleNoProgress() {
         holdStillForPlanning();
         noProgressTicks = 0;
-        replanAttempts++;
+        noProgressReplans++;
+        HumanBuilderMod.LOGGER.warn(
+                "[HumanBuilder] No movement progress toward {} (replan {}/3, route={})",
+                targetBlockPos == null ? "unknown" : targetBlockPos.toShortString(),
+                noProgressReplans,
+                describeRoute());
 
         if (targetBlockPos != null) {
             Vec3d alternative = findStandingPosition(targetBlockPos, true);
@@ -340,7 +473,7 @@ public class MovementController {
             }
         }
 
-        if (replanAttempts <= 3) {
+        if (noProgressReplans <= 3) {
             scheduleRoutePlanning(1);
             return;
         }
@@ -369,10 +502,13 @@ public class MovementController {
         Vec3d pos = client.player.getPos();
         double horizontal = Math.hypot(standingTarget.x - pos.x, standingTarget.z - pos.z);
         double vertical = Math.abs(standingTarget.y - pos.y);
-        return horizontal < (flyingRoute ? 0.40 : FINAL_DISTANCE)
-                && vertical < (flyingRoute ? 0.65 : 1.15)
-                && targetBlockPos != null
-                && canInteractFromCurrentPosition();
+        boolean arrived = flyingRoute
+                ? isWithinPreciseFlightEndpoint(horizontal, vertical)
+                : horizontal < FINAL_DISTANCE && vertical < 1.15;
+        if (!arrived) return false;
+        if (targetBlockPos == null) return true;
+
+        return canInteractFromCurrentPosition();
     }
 
     /** Stops current input but preserves flight between nearby build targets. */
@@ -499,6 +635,7 @@ public class MovementController {
         bestWaypointDistance = Double.MAX_VALUE;
         noProgressTicks = 0;
         blockedEndpointTicks = 0;
+        planningAttempts = 0;
     }
 
     private Vec3d findStandingPosition(BlockPos targetPos, boolean forceDifferent) {
@@ -519,24 +656,60 @@ public class MovementController {
                                            boolean requireGround) {
         List<StandingCandidate> candidates = new ArrayList<>();
 
-        for (int radius = 2; radius <= 4; radius++) {
+        int minDy = requireGround ? -4 : -2;
+        int maxDy = 2;
+
+        for (int radius = 0; radius <= 4; radius++) {
             for (int dx = -radius; dx <= radius; dx++) {
                 for (int dz = -radius; dz <= radius; dz++) {
                     if (Math.abs(dx) != radius && Math.abs(dz) != radius) continue;
 
-                    for (int dy = -2; dy <= 3; dy++) {
+                    for (int dy = minDy; dy <= maxDy; dy++) {
                         BlockPos candidate = targetPos.add(dx, dy, dz);
                         if (requireGround ? !isStandable(candidate) : !isBodyClear(candidate)) continue;
                         if (intersectsReservedBuildSpace(candidate)) continue;
 
+                        if (!requireGround) {
+                            Box playerBox = new Box(
+                                    candidate.getX() + 0.2, candidate.getY(), candidate.getZ() + 0.2,
+                                    candidate.getX() + 0.8, candidate.getY() + 1.8, candidate.getZ() + 0.8
+                            );
+                            Box targetBox = new Box(
+                                    targetPos.getX(), targetPos.getY(), targetPos.getZ(),
+                                    targetPos.getX() + 1, targetPos.getY() + 1, targetPos.getZ() + 1
+                            );
+                            if (playerBox.expand(BUILD_CLEARANCE_MARGIN).intersects(targetBox)) continue;
+                        }
+
                         Vec3d feet = Vec3d.ofBottomCenter(candidate);
-                        if (forceDifferent && (attemptedStandingPositions.contains(candidate)
-                                || feet.distanceTo(playerPos) < 1.0)) continue;
+                        if (forceDifferent && attemptedStandingPositions.contains(candidate)) continue;
 
                         Vec3d eye = feet.add(0, 1.62, 0);
                         if (eye.distanceTo(Vec3d.ofCenter(targetPos)) > REACH_DISTANCE) continue;
-                        double score = feet.squaredDistanceTo(playerPos) + radius * 0.35 + Math.abs(dy) * 1.5;
-                        if (!requireGround && dy < 2) score += (2 - dy) * 25.0;
+
+                        if (targetBlockState != null && placer.requiresPlacementFacing(targetBlockState)) {
+                            double blockDx = targetPos.getX() + 0.5 - eye.x;
+                            double blockDz = targetPos.getZ() + 0.5 - eye.z;
+                            float blockYaw = (float) (Math.toDegrees(Math.atan2(blockDz, blockDx)) - 90.0);
+                            float desiredYaw = placer.getPlacementYaw(targetBlockState);
+                            float diff = Math.abs(net.minecraft.util.math.MathHelper.wrapDegrees(blockYaw - desiredYaw));
+                            if (diff > 50.0f) continue;
+                        }
+
+                        double score;
+                        if (cinematicMode) {
+                            double yDiff = Math.abs(feet.y - playerPos.y);
+                            score = feet.squaredDistanceTo(playerPos) + radius * 0.35 + yDiff * 15.0;
+                            if (!requireGround && dy < 0) score += Math.abs(dy) * 30.0;
+                            if (!requireGround && radius < 2) score += 50.0;
+                            if (!requireGround && dx == 0 && dz == 0) score += 500.0; // Stay off direct vertical axis
+                        } else {
+                            double yDiff = Math.abs(feet.y - playerPos.y);
+                            score = feet.squaredDistanceTo(playerPos) + radius * 0.35 + Math.abs(dy) * 1.5 + yDiff * 10.0;
+                            if (!requireGround && dy < 0) score += Math.abs(dy) * 30.0;
+                            if (!requireGround && dy < 2) score += (2 - dy) * 25.0;
+                            if (!requireGround && radius < 2) score += 50.0;
+                        }
                         candidates.add(new StandingCandidate(candidate, eye, score));
                     }
                 }
@@ -562,6 +735,13 @@ public class MovementController {
 
     private List<BlockPos> findDirectFlightPath(BlockPos start, BlockPos goal) {
         if (start.equals(goal)) return List.of();
+
+        if (cinematicMode) {
+            List<BlockPos> directPath = new ArrayList<>();
+            if (appendClearLine(directPath, start, goal)) {
+                return directPath;
+            }
+        }
 
         int targetY = targetBlockPos == null ? goal.getY() : targetBlockPos.getY();
         int cruiseY = Math.max(Math.max(start.getY(), goal.getY()), targetY + 3);
@@ -765,6 +945,26 @@ public class MovementController {
                 && client.world.getFluidState(feet.up()).isEmpty();
     }
 
+    private boolean isStandingTargetAvailable() {
+        if (standingTarget == null) return false;
+        BlockPos feet = BlockPos.ofFloored(standingTarget);
+        return isBodyClear(feet) && !intersectsReservedBuildSpace(feet);
+    }
+
+    private boolean selectAlternativeStandingTarget() {
+        if (targetBlockPos == null || standingTarget == null) return false;
+        BlockPos blocked = BlockPos.ofFloored(standingTarget);
+        attemptedStandingPositions.add(blocked);
+        rememberBodyObstacle(blocked);
+        Vec3d alternative = findStandingPosition(targetBlockPos, true);
+        if (alternative == null) return false;
+        standingTarget = alternative;
+        bestWaypointDistance = Double.MAX_VALUE;
+        noProgressTicks = 0;
+        blockedEndpointTicks = 0;
+        return true;
+    }
+
     private boolean intersectsReservedBuildSpace(BlockPos feet) {
         return reservedBuildPosition.test(feet) || reservedBuildPosition.test(feet.up());
     }
@@ -831,9 +1031,16 @@ public class MovementController {
 
     private boolean canInteractFromCurrentPosition() {
         if (targetBlockPos == null) return false;
-        return targetBlockState == null
-                ? placer.canBreakFromCurrentPosition(targetBlockPos)
-                : placer.canPlaceFromCurrentPosition(targetBlockPos, targetBlockState);
+        if (targetBlockState == null) {
+            return placer.canBreakFromCurrentPosition(targetBlockPos);
+        }
+        return !placer.wouldPlacementIntersectPlayer(targetBlockPos, targetBlockState)
+                && placer.canPlaceFromCurrentPosition(targetBlockPos, targetBlockState);
+    }
+
+    static boolean isWithinPreciseFlightEndpoint(double horizontal, double vertical) {
+        return horizontal < FLIGHT_FINAL_HORIZONTAL_DISTANCE
+                && vertical < FLIGHT_FINAL_VERTICAL_DISTANCE;
     }
 
     private boolean isBlockedAtFinalApproach(Vec3d playerPos) {
