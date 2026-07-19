@@ -13,6 +13,7 @@ import com.humanbuilder.timing.HumanTiming;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.SlabBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
@@ -43,6 +44,7 @@ public class BuildExecutor {
     private static final int MAX_TEMPORARY_SUPPORT_LENGTH = 96;
     private static final int MAX_TEMPORARY_SUPPORT_SEARCH_NODES = 16_384;
     private static final int MAX_SUPPORT_WORLD_RECHECKS = 4;
+    private static final int MAX_SLAB_SYNC_RECHECKS = 2;
 
     private final MinecraftClient client;
     private final CameraSmoother camera;
@@ -1680,7 +1682,7 @@ public class BuildExecutor {
         BlockState selectedState = temporarySupportState();
         for (BuildEntry root : roots) {
             List<BlockPos> path = findTemporarySupportPath(
-                    root.pos(), lockedWorkGroup);
+                    root.pos(), root.state(), lockedWorkGroup);
             if (!path.isEmpty()
                     && (selectedPath.isEmpty() || path.size() < selectedPath.size())) {
                 selectedRoot = root;
@@ -1712,10 +1714,12 @@ public class BuildExecutor {
 
     private List<BlockPos> findTemporarySupportPath(
             BlockPos target,
+            BlockState targetState,
             int lockedWorkGroup
     ) {
         return TemporarySupportPathfinder.find(
                 target,
+                placer.getPlacementSupportDirections(targetState),
                 pos -> isTemporarySupportCell(pos, lockedWorkGroup),
                 this::hasUsableWorldSupport,
                 MAX_TEMPORARY_SUPPORT_LENGTH,
@@ -2135,7 +2139,7 @@ public class BuildExecutor {
 
     private void schedulePlacementVerification(BuildEntry entry) {
         placementVerifications.put(entry.pos(), new PlacementVerification(
-                entry, executorTicks + requiredPlacementVerificationTicks()));
+                entry, executorTicks + requiredPlacementVerificationTicks(), 0));
     }
 
     private void processPlacementVerifications() {
@@ -2149,10 +2153,25 @@ public class BuildExecutor {
             PlacementVerification verification = pending.getValue();
             if (executorTicks < verification.dueTick()) continue;
 
-            iterator.remove();
             BuildEntry entry = verification.entry();
             BlockState actual = client.world.getBlockState(entry.pos());
-            if (placer.matchesPlacementState(actual, entry.state())) continue;
+            if (placer.matchesPlacementState(actual, entry.state())) {
+                iterator.remove();
+                continue;
+            }
+
+            // Retrying a slab packet while the first response is still in
+            // flight can merge the valid half into an unwanted DOUBLE slab.
+            if (entry.state().getBlock() instanceof SlabBlock
+                    && actual.isReplaceable()
+                    && verification.syncRechecks() < MAX_SLAB_SYNC_RECHECKS) {
+                pending.setValue(new PlacementVerification(
+                        entry,
+                        executorTicks + requiredPlacementVerificationTicks(),
+                        verification.syncRechecks() + 1));
+                continue;
+            }
+            iterator.remove();
 
             if (entry.temporary()) {
                 temporarySupports.remove(entry.pos());
@@ -2603,5 +2622,9 @@ public class BuildExecutor {
                 new SupportBootstrapResult(null, false);
     }
 
-    private record PlacementVerification(BuildEntry entry, long dueTick) {}
+    private record PlacementVerification(
+            BuildEntry entry,
+            long dueTick,
+            int syncRechecks
+    ) {}
 }

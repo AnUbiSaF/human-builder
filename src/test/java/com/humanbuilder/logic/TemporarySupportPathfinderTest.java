@@ -1,6 +1,7 @@
 package com.humanbuilder.logic;
 
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -41,6 +42,24 @@ class TemporarySupportPathfinderTest {
                 1_000);
 
         assertTrue(path.isEmpty());
+    }
+
+    @Test
+    void scaffoldTouchesAnAxisControlledTargetFromAnAllowedSide() {
+        BlockPos target = new BlockPos(0, 5, 0);
+        List<BlockPos> path = TemporarySupportPathfinder.find(
+                target,
+                new Direction[] {Direction.WEST, Direction.EAST},
+                pos -> pos.getY() >= 1 && !pos.equals(target),
+                pos -> pos.getY() == 1,
+                16,
+                1_000);
+
+        assertFalse(path.isEmpty());
+        BlockPos finalSupport = path.get(path.size() - 1);
+        assertEquals(target.getY(), finalSupport.getY());
+        assertEquals(target.getZ(), finalSupport.getZ());
+        assertEquals(1, Math.abs(target.getX() - finalSupport.getX()));
     }
 
     private int manhattan(BlockPos first, BlockPos second) {

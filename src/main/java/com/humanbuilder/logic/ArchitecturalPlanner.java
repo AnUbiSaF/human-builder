@@ -46,9 +46,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.NavigableMap;
 import java.util.Set;
-import java.util.TreeMap;
 
 /**
  * Geometry-first planner for replay-friendly construction. A configurable
@@ -60,6 +58,9 @@ public final class ArchitecturalPlanner {
     public static final int MAX_LAYERED_BASE_HEIGHT = 8;
     public static final int DEFAULT_LAYERED_BASE_HEIGHT = 1;
     private static final int MAX_EXTERIOR_WALL_DEPTH = 1;
+    private static final int EXTERIOR_PORTAL_RADIUS = 2;
+    private static final int EXTERIOR_SURFACE_REACH = 3;
+    private static final int MAX_DIRECT_EXTERIOR_DEPTH = 4;
 
     private int layeredBaseHeight = DEFAULT_LAYERED_BASE_HEIGHT;
 
@@ -82,6 +83,20 @@ public final class ArchitecturalPlanner {
                 Math.min(MAX_LAYERED_BASE_HEIGHT, layeredBaseHeight));
     }
 
+    boolean isExteriorAir(Set<BlockPos> component, BlockPos air) {
+        if (component.isEmpty()) return true;
+        return OutdoorAirIndex.create(component, Bounds.of(component)).isOutdoorAir(air);
+    }
+
+    RoomLayout analyzeRooms(Set<BlockPos> component) {
+        if (component.isEmpty()) {
+            return RoomLayout.detect(Set.of(), ignored -> true);
+        }
+        OutdoorAirIndex outdoor = OutdoorAirIndex.create(
+                component, Bounds.of(component));
+        return RoomLayout.detect(component, outdoor::isOutdoorAir);
+    }
+
     public List<BuildEntry> plan(Map<BlockPos, BlockState> blocks, BlockPos start) {
         if (blocks.isEmpty()) return List.of();
 
@@ -91,21 +106,36 @@ public final class ArchitecturalPlanner {
         }
 
         Bounds globalBounds = Bounds.of(immutableBlocks.keySet());
-        EnumMap<Phase, NavigableMap<Integer, Set<BlockPos>>> positionsByY =
-                new EnumMap<>(Phase.class);
-        for (Phase phase : Phase.values()) positionsByY.put(phase, new TreeMap<>());
-
+        Map<BlockPos, Phase> phaseByPosition = new HashMap<>();
         for (Set<BlockPos> component : connectedComponents(immutableBlocks.keySet())) {
             EnumMap<Phase, Set<BlockPos>> classified = classifyComponent(
                     component, immutableBlocks);
             for (Phase phase : Phase.values()) {
                 for (BlockPos pos : classified.get(phase)) {
-                    int localY = localY(pos, globalBounds);
-                    positionsByY.get(phase)
-                            .computeIfAbsent(localY, ignored -> new HashSet<>())
-                            .add(pos);
+                    phaseByPosition.put(pos, phase);
                 }
             }
+        }
+
+        RoomLayout rooms = analyzeRooms(immutableBlocks.keySet());
+        promoteConnectedExteriorFinish(
+                phaseByPosition, immutableBlocks, rooms);
+
+        Map<BlockPos, RoomLayout.BoundaryInfo> boundaries = new HashMap<>();
+        Set<BlockPos> skeleton = new HashSet<>();
+        for (BlockPos pos : immutableBlocks.keySet()) {
+            Phase phase = phaseByPosition.get(pos);
+            BlockState state = immutableBlocks.get(pos);
+            RoomLayout.BoundaryInfo boundary = rooms.boundaryInfo(pos);
+            boundaries.put(pos, boundary);
+
+            boolean frame = phase == Phase.CONTOUR
+                    || phase == Phase.OPAQUE_SHELL
+                    || phase == Phase.ROOF;
+            boolean interiorStructure = phase == Phase.INTERIOR_STRUCTURE
+                    && (!boundary.axes().isEmpty() || rooms.isStructuralRun(pos));
+            boolean glassPartition = isGlass(state) && boundary.separatesRooms();
+            if (frame || interiorStructure || glassPartition) skeleton.add(pos);
         }
 
         List<BuildEntry> result = new ArrayList<>(blocks.size());
@@ -113,28 +143,28 @@ public final class ArchitecturalPlanner {
         BlockPos cursor = start;
         int workGroup = 1;
         int maxLocalY = globalBounds.maxY() - globalBounds.minY() + 1;
-        List<Phase> framePhases = List.of(
-                Phase.CONTOUR, Phase.OPAQUE_SHELL, Phase.ROOF);
-        List<Phase> basePhases = List.of(
-                Phase.CONTOUR, Phase.OPAQUE_SHELL, Phase.ROOF,
-                Phase.INTERIOR_STRUCTURE);
 
-        // Y=1..X is a strict layer-by-layer structural base. Glass and decor
-        // stay deferred, but floors and other load-bearing interior blocks do not.
-        for (int localY = 1; localY <= maxLocalY; localY++) {
-            boolean layeredBase = localY <= layeredBaseHeight;
-            Map<BlockPos, Phase> phaseByPosition = collectLayer(
-                    positionsByY, layeredBase ? basePhases : framePhases, localY);
+        // Preserve the configured strict base, then switch from global Y bands
+        // to complete architectural surfaces.
+        for (int localY = 1;
+             localY <= Math.min(layeredBaseHeight, maxLocalY);
+             localY++) {
+            Set<BlockPos> layer = new HashSet<>();
+            for (BlockPos pos : immutableBlocks.keySet()) {
+                Phase phase = phaseByPosition.get(pos);
+                if (localY(pos, globalBounds) == localY
+                        && (skeleton.contains(pos) || phase == Phase.INTERIOR_STRUCTURE)) {
+                    layer.add(pos);
+                }
+            }
             List<List<BlockPos>> groups = connectedWorkGroups(
-                    phaseByPosition.keySet(), immutableBlocks.keySet(), planned,
+                    layer, immutableBlocks.keySet(), planned,
                     immutableBlocks, globalBounds, cursor, phaseByPosition);
             for (List<BlockPos> group : groups) {
                 for (BlockPos pos : group) {
-                    BlockCategory category = layeredBase
-                            ? BlockCategory.FOUNDATION
-                            : categoryFor(phaseByPosition.get(pos));
                     result.add(new BuildEntry(
-                            pos, immutableBlocks.get(pos), category, workGroup));
+                            pos, immutableBlocks.get(pos),
+                            BlockCategory.FOUNDATION, workGroup));
                     planned.add(pos);
                 }
                 cursor = group.get(group.size() - 1);
@@ -142,30 +172,124 @@ public final class ArchitecturalPlanner {
             }
         }
 
-        for (Phase phase : List.of(
-                Phase.EXTERIOR_FINISH,
-                Phase.INTERIOR_STRUCTURE,
-                Phase.INTERIOR_DETAIL)) {
-            int firstY = phase == Phase.INTERIOR_STRUCTURE
-                    ? layeredBaseHeight + 1
-                    : 1;
-            for (int localY = firstY; localY <= maxLocalY; localY++) {
-                Set<BlockPos> positions = positionsByY.get(phase)
-                        .getOrDefault(localY, Set.of());
-                List<List<BlockPos>> groups = workGroupsForPhase(
+        Set<BlockPos> contour = new HashSet<>();
+        for (BlockPos pos : skeleton) {
+            if (!planned.contains(pos) && phaseByPosition.get(pos) == Phase.CONTOUR) {
+                contour.add(pos);
+            }
+        }
+        for (List<BlockPos> group : connectedWorkGroups(
+                contour, immutableBlocks.keySet(), planned,
+                immutableBlocks, globalBounds, cursor, phaseByPosition)) {
+            for (BlockPos pos : group) {
+                result.add(new BuildEntry(
+                        pos, immutableBlocks.get(pos), BlockCategory.PILLAR, workGroup));
+                planned.add(pos);
+            }
+            cursor = group.get(group.size() - 1);
+            workGroup++;
+        }
+
+        Set<BlockPos> structuralSurfaces = new HashSet<>(skeleton);
+        structuralSurfaces.removeAll(planned);
+        List<AtomicGroup> surfaceGroups = structuralSurfaceGroups(
+                structuralSurfaces, phaseByPosition, boundaries,
+                immutableBlocks.keySet());
+        for (List<BlockPos> group : orderAtomicGroups(
+                surfaceGroups, immutableBlocks.keySet(), planned,
+                immutableBlocks, globalBounds, cursor, phaseByPosition)) {
+            for (BlockPos pos : group) {
+                BlockCategory category = phaseByPosition.get(pos) == Phase.ROOF
+                        ? BlockCategory.ROOF : BlockCategory.WALL;
+                result.add(new BuildEntry(
+                        pos, immutableBlocks.get(pos), category, workGroup));
+                planned.add(pos);
+            }
+            cursor = group.get(group.size() - 1);
+            workGroup++;
+        }
+
+        Set<BlockPos> exteriorFinish = new HashSet<>();
+        for (Map.Entry<BlockPos, Phase> entry : phaseByPosition.entrySet()) {
+            if (entry.getValue() == Phase.EXTERIOR_FINISH
+                    && !planned.contains(entry.getKey())) {
+                exteriorFinish.add(entry.getKey());
+            }
+        }
+        for (List<BlockPos> group : orderFacadeElements(
+                exteriorFinish, immutableBlocks.keySet(), planned,
+                immutableBlocks, cursor)) {
+            for (BlockPos pos : group) {
+                result.add(new BuildEntry(
+                        pos, immutableBlocks.get(pos), BlockCategory.WINDOW, workGroup));
+                planned.add(pos);
+            }
+            cursor = group.get(group.size() - 1);
+            workGroup++;
+        }
+
+        Map<Integer, Set<BlockPos>> workByRoom = new HashMap<>();
+        Set<BlockPos> unassigned = new HashSet<>();
+        for (BlockPos pos : immutableBlocks.keySet()) {
+            if (planned.contains(pos)) continue;
+            java.util.OptionalInt room = rooms.roomForBlock(pos);
+            if (room.isPresent()) {
+                workByRoom.computeIfAbsent(room.getAsInt(), ignored -> new HashSet<>())
+                        .add(pos);
+            } else {
+                unassigned.add(pos);
+            }
+        }
+
+        while (!workByRoom.isEmpty()) {
+            BlockPos selectionOrigin = cursor;
+            int roomId = workByRoom.entrySet().stream()
+                    .min(Comparator
+                            .comparingDouble((Map.Entry<Integer, Set<BlockPos>> entry) ->
+                                    distanceToComponent(entry.getValue(), selectionOrigin))
+                            .thenComparingInt(Map.Entry::getKey))
+                    .orElseThrow()
+                    .getKey();
+            Set<BlockPos> roomWork = workByRoom.remove(roomId);
+
+            for (Phase localPhase : List.of(
+                    Phase.INTERIOR_STRUCTURE, Phase.INTERIOR_DETAIL)) {
+                Set<BlockPos> positions = new HashSet<>();
+                for (BlockPos pos : roomWork) {
+                    if (phaseByPosition.get(pos) == localPhase
+                            || localPhase == Phase.INTERIOR_DETAIL
+                            && phaseByPosition.get(pos) != Phase.INTERIOR_STRUCTURE) {
+                        positions.add(pos);
+                    }
+                }
+                roomWork.removeAll(positions);
+                for (List<BlockPos> group : connectedWorkGroups(
                         positions, immutableBlocks.keySet(), planned,
-                        immutableBlocks, globalBounds, cursor);
-                for (List<BlockPos> group : groups) {
-                    BlockCategory category = categoryFor(phase);
+                        immutableBlocks, globalBounds, cursor, phaseByPosition)) {
                     for (BlockPos pos : group) {
                         result.add(new BuildEntry(
-                                pos, immutableBlocks.get(pos), category, workGroup));
+                                pos, immutableBlocks.get(pos),
+                                categoryFor(phaseByPosition.get(pos)), workGroup));
                         planned.add(pos);
                     }
                     cursor = group.get(group.size() - 1);
                     workGroup++;
                 }
             }
+            unassigned.addAll(roomWork);
+        }
+
+        for (List<BlockPos> group : connectedWorkGroups(
+                unassigned, immutableBlocks.keySet(), planned,
+                immutableBlocks, globalBounds, cursor, phaseByPosition)) {
+            for (BlockPos pos : group) {
+                result.add(new BuildEntry(
+                        pos, immutableBlocks.get(pos),
+                        categoryFor(phaseByPosition.get(pos)), workGroup));
+                planned.add(pos);
+            }
+            cursor = group.get(group.size() - 1);
+            workGroup++;
         }
         return result;
     }
@@ -175,7 +299,7 @@ public final class ArchitecturalPlanner {
             Map<BlockPos, BlockState> blocks
     ) {
         Bounds bounds = Bounds.of(component);
-        OutdoorAirIndex outdoor = OutdoorAirIndex.create(component);
+        OutdoorAirIndex outdoor = OutdoorAirIndex.create(component, bounds);
         Set<BlockPos> roof = findRoof(component, blocks, outdoor, bounds);
         Map<BlockPos, Set<Direction>> outdoorFacesByPosition = new HashMap<>();
         for (BlockPos pos : component) {
@@ -193,7 +317,9 @@ public final class ArchitecturalPlanner {
             Phase phase;
 
             if (isAlwaysDecor(state)) {
-                phase = Phase.INTERIOR_DETAIL;
+                phase = exteriorVisible
+                        ? Phase.EXTERIOR_FINISH
+                        : Phase.INTERIOR_DETAIL;
             } else if (isContourEligible(state)
                     && isContour(pos, component, outdoor, outdoorFaces, bounds)) {
                 phase = Phase.CONTOUR;
@@ -224,39 +350,160 @@ public final class ArchitecturalPlanner {
             Map<BlockPos, Set<Direction>> outdoorFacesByPosition
     ) {
         Set<BlockPos> shell = new HashSet<>();
-        for (BlockPos pos : component) {
-            if (!outdoorFacesByPosition.get(pos).isEmpty()
-                    && isContourEligible(blocks.get(pos))) {
-                shell.add(pos);
-            }
-        }
-
-        for (BlockPos surface : List.copyOf(shell)) {
+        for (BlockPos surface : component) {
             for (Direction exteriorFace : outdoorFacesByPosition.get(surface)) {
                 BlockPos cursor = surface;
-                for (int depth = 0; depth < MAX_EXTERIOR_WALL_DEPTH; depth++) {
-                    cursor = cursor.offset(exteriorFace.getOpposite());
-                    if (!component.contains(cursor)
-                            || !isContourEligible(blocks.get(cursor))) {
+                int structuralLayers = 0;
+                while (component.contains(cursor)) {
+                    if (isContourEligible(blocks.get(cursor))) {
+                        shell.add(cursor);
+                        structuralLayers++;
+                        if (structuralLayers > MAX_EXTERIOR_WALL_DEPTH) break;
+                    } else if (!cursor.equals(surface)) {
                         break;
                     }
-                    shell.add(cursor);
+                    cursor = cursor.offset(exteriorFace.getOpposite());
                 }
             }
         }
         return shell;
     }
 
-    private Map<BlockPos, Phase> collectLayer(
-            EnumMap<Phase, NavigableMap<Integer, Set<BlockPos>>> positionsByY,
-            List<Phase> phases,
-            int localY
+    private void promoteConnectedExteriorFinish(
+            Map<BlockPos, Phase> phaseByPosition,
+            Map<BlockPos, BlockState> blocks,
+            RoomLayout rooms
     ) {
-        Map<BlockPos, Phase> result = new HashMap<>();
-        for (Phase phase : phases) {
-            for (BlockPos pos : positionsByY.get(phase).getOrDefault(localY, Set.of())) {
-                result.put(pos, phase);
+        Set<BlockPos> finishCandidates = new HashSet<>();
+        for (Map.Entry<BlockPos, BlockState> entry : blocks.entrySet()) {
+            if (isExteriorFinishElement(entry.getValue())
+                    || isAlwaysDecor(entry.getValue())) {
+                finishCandidates.add(entry.getKey());
             }
+        }
+
+        Set<BlockPos> exteriorSeeds = new HashSet<>();
+        for (BlockPos pos : finishCandidates) {
+            if (phaseByPosition.get(pos) == Phase.EXTERIOR_FINISH
+                    || rooms.boundaryInfo(pos).touchesOutside()) {
+                exteriorSeeds.add(pos);
+            }
+        }
+        for (BlockPos pos : expandConnectedElements(finishCandidates, exteriorSeeds)) {
+            phaseByPosition.put(pos, Phase.EXTERIOR_FINISH);
+        }
+    }
+
+    Set<BlockPos> expandConnectedElements(
+            Set<BlockPos> candidates,
+            Set<BlockPos> seeds
+    ) {
+        Set<BlockPos> result = new HashSet<>();
+        for (Set<BlockPos> element : splitComponents(candidates, true)) {
+            if (element.stream().anyMatch(seeds::contains)) result.addAll(element);
+        }
+        return result;
+    }
+
+    private List<AtomicGroup> structuralSurfaceGroups(
+            Set<BlockPos> positions,
+            Map<BlockPos, Phase> phaseByPosition,
+            Map<BlockPos, RoomLayout.BoundaryInfo> boundaries,
+            Set<BlockPos> occupied
+    ) {
+        Map<SurfaceKey, Set<BlockPos>> bySurface = new HashMap<>();
+        for (BlockPos pos : positions) {
+            SurfaceKey key = surfaceKey(
+                    pos, phaseByPosition.get(pos), boundaries.get(pos), occupied);
+            bySurface.computeIfAbsent(key, ignored -> new HashSet<>()).add(pos);
+        }
+
+        List<AtomicGroup> result = new ArrayList<>();
+        for (Map.Entry<SurfaceKey, Set<BlockPos>> entry : bySurface.entrySet()) {
+            int rank = entry.getKey().kind() == SurfaceKind.HORIZONTAL ? 1 : 0;
+            if (entry.getKey().kind() != SurfaceKind.NETWORK) {
+                // Openings and already-built contour columns can disconnect a
+                // wall geometrically, but they must not split the timelapse job.
+                result.add(new AtomicGroup(Set.copyOf(entry.getValue()), rank));
+                continue;
+            }
+            for (Set<BlockPos> component : splitComponents(entry.getValue(), true)) {
+                result.add(new AtomicGroup(component, rank));
+            }
+        }
+        return result;
+    }
+
+    private SurfaceKey surfaceKey(
+            BlockPos pos,
+            Phase phase,
+            RoomLayout.BoundaryInfo boundary,
+            Set<BlockPos> occupied
+    ) {
+        EnumSet<Direction.Axis> axes = boundary == null
+                ? EnumSet.noneOf(Direction.Axis.class)
+                : boundary.axes();
+        if (phase == Phase.ROOF || axes.contains(Direction.Axis.Y)) {
+            return new SurfaceKey(SurfaceKind.HORIZONTAL, pos.getY());
+        }
+        if (axes.size() == 1 && axes.contains(Direction.Axis.X)) {
+            return new SurfaceKey(SurfaceKind.VERTICAL_X, pos.getX());
+        }
+        if (axes.size() == 1 && axes.contains(Direction.Axis.Z)) {
+            return new SurfaceKey(SurfaceKind.VERTICAL_Z, pos.getZ());
+        }
+
+        boolean exposedX = !occupied.contains(pos.west()) || !occupied.contains(pos.east());
+        boolean exposedZ = !occupied.contains(pos.north()) || !occupied.contains(pos.south());
+        if (exposedX && !exposedZ) {
+            return new SurfaceKey(SurfaceKind.VERTICAL_X, pos.getX());
+        }
+        if (exposedZ && !exposedX) {
+            return new SurfaceKey(SurfaceKind.VERTICAL_Z, pos.getZ());
+        }
+        return new SurfaceKey(SurfaceKind.NETWORK, 0);
+    }
+
+    private List<List<BlockPos>> orderAtomicGroups(
+            List<AtomicGroup> groups,
+            Set<BlockPos> component,
+            Set<BlockPos> planned,
+            Map<BlockPos, BlockState> blocks,
+            Bounds bounds,
+            BlockPos start,
+            Map<BlockPos, Phase> phaseByPosition
+    ) {
+        List<AtomicGroup> remaining = new ArrayList<>(groups);
+        List<List<BlockPos>> result = new ArrayList<>();
+        Set<BlockPos> emitted = new HashSet<>(planned);
+        BlockPos cursor = start;
+
+        while (!remaining.isEmpty()) {
+            int rank = remaining.stream().mapToInt(AtomicGroup::rank).min().orElseThrow();
+            List<AtomicGroup> ranked = remaining.stream()
+                    .filter(group -> group.rank() == rank)
+                    .toList();
+            List<AtomicGroup> supported = ranked.stream()
+                    .filter(group -> group.positions().stream().anyMatch(pos ->
+                            isSupportedByPlan(
+                                    pos, component, emitted, Set.of(), blocks, bounds.minY())))
+                    .toList();
+            List<AtomicGroup> candidates = supported.isEmpty() ? ranked : supported;
+            BlockPos selectionOrigin = cursor;
+            AtomicGroup next = candidates.stream()
+                    .min(Comparator
+                            .comparingDouble((AtomicGroup group) ->
+                                    distanceToComponent(group.positions(), selectionOrigin))
+                            .thenComparingInt(group -> -group.positions().size()))
+                    .orElseThrow();
+            remaining.remove(next);
+
+            List<BlockPos> ordered = orderSupportAware(
+                    next.positions(), component, emitted, blocks,
+                    bounds, cursor, phaseByPosition);
+            result.add(ordered);
+            emitted.addAll(ordered);
+            cursor = ordered.get(ordered.size() - 1);
         }
         return result;
     }
@@ -276,6 +523,18 @@ public final class ArchitecturalPlanner {
         if (positions.isEmpty()) return List.of();
         return connectedWorkGroups(
                 positions, component, planned, blocks, bounds, start);
+    }
+
+    List<List<BlockPos>> orderFacadeElements(
+            Set<BlockPos> positions,
+            Set<BlockPos> component,
+            Set<BlockPos> planned,
+            Map<BlockPos, BlockState> blocks,
+            BlockPos start
+    ) {
+        if (positions.isEmpty() || component.isEmpty()) return List.of();
+        return workGroupsForPhase(
+                positions, component, planned, blocks, Bounds.of(component), start);
     }
 
     /**
@@ -844,6 +1103,17 @@ public final class ArchitecturalPlanner {
         }
     }
 
+    private enum SurfaceKind {
+        VERTICAL_X,
+        VERTICAL_Z,
+        HORIZONTAL,
+        NETWORK
+    }
+
+    private record SurfaceKey(SurfaceKind kind, int coordinate) {}
+
+    private record AtomicGroup(Set<BlockPos> positions, int rank) {}
+
     private record Bounds(int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {
         static Bounds of(Set<BlockPos> positions) {
             int minX = Integer.MAX_VALUE;
@@ -865,29 +1135,39 @@ public final class ArchitecturalPlanner {
     }
 
     /**
-     * Air visible from the sky or along an unobstructed horizontal exterior ray.
-     * Horizontal rays recognize deep walls below wide eaves without flooding
-     * through glass into closed rooms.
+     * Outdoor air connected through a wide opening. The temporary expanded
+     * envelope closes ordinary windows and doors, so their openings cannot
+     * turn every wall inside a room into facade; courtyards and broad recesses
+     * still retain an exterior air core.
      */
     private static final class OutdoorAirIndex {
         private final Set<BlockPos> occupied;
+        private final Set<Long> outdoorAir;
+        private final Bounds bounds;
         private final Map<Long, Integer> highestYByXZ;
         private final Map<Long, Extent> xExtentByYZ;
         private final Map<Long, Extent> zExtentByXY;
 
         private OutdoorAirIndex(
                 Set<BlockPos> occupied,
+                Set<Long> outdoorAir,
+                Bounds bounds,
                 Map<Long, Integer> highestYByXZ,
                 Map<Long, Extent> xExtentByYZ,
                 Map<Long, Extent> zExtentByXY
         ) {
             this.occupied = occupied;
+            this.outdoorAir = outdoorAir;
+            this.bounds = bounds;
             this.highestYByXZ = highestYByXZ;
             this.xExtentByYZ = xExtentByYZ;
             this.zExtentByXY = zExtentByXY;
         }
 
-        static OutdoorAirIndex create(Set<BlockPos> occupied) {
+        static OutdoorAirIndex create(Set<BlockPos> occupied, Bounds bounds) {
+            int searchRadius = EXTERIOR_PORTAL_RADIUS + 1;
+            Set<Long> nearbyAir = new HashSet<>(Math.max(16, occupied.size() * 12));
+            Set<Long> expandedEnvelope = new HashSet<>(Math.max(16, occupied.size() * 6));
             Map<Long, Integer> highestYByXZ = new HashMap<>();
             Map<Long, Extent> xExtentByYZ = new HashMap<>();
             Map<Long, Extent> zExtentByXY = new HashMap<>();
@@ -896,27 +1176,90 @@ public final class ArchitecturalPlanner {
                         pair(pos.getX(), pos.getZ()), pos.getY(), Math::max);
                 xExtentByYZ.merge(
                         pair(pos.getY(), pos.getZ()),
-                        new Extent(pos.getX(), pos.getX()),
-                        Extent::merge);
+                        new Extent(pos.getX(), pos.getX()), Extent::merge);
                 zExtentByXY.merge(
                         pair(pos.getX(), pos.getY()),
-                        new Extent(pos.getZ(), pos.getZ()),
-                        Extent::merge);
+                        new Extent(pos.getZ(), pos.getZ()), Extent::merge);
+                for (int dx = -searchRadius; dx <= searchRadius; dx++) {
+                    for (int dy = -searchRadius; dy <= searchRadius; dy++) {
+                        for (int dz = -searchRadius; dz <= searchRadius; dz++) {
+                            if (dx == 0 && dy == 0 && dz == 0) continue;
+                            int distance = Math.max(
+                                    Math.max(Math.abs(dx), Math.abs(dy)), Math.abs(dz));
+                            BlockPos air = pos.add(dx, dy, dz);
+                            if (occupied.contains(air)) continue;
+                            long packed = air.asLong();
+                            nearbyAir.add(packed);
+                            if (distance <= EXTERIOR_PORTAL_RADIUS) {
+                                expandedEnvelope.add(packed);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Set<Long> exteriorCore = new HashSet<>();
+            ArrayDeque<BlockPos> open = new ArrayDeque<>();
+            for (long packed : nearbyAir) {
+                BlockPos pos = BlockPos.fromLong(packed);
+                if (!expandedEnvelope.contains(packed)
+                        && touchesBounds(pos, bounds)
+                        && exteriorCore.add(packed)) {
+                    open.addLast(pos);
+                }
+            }
+            while (!open.isEmpty()) {
+                BlockPos current = open.removeFirst();
+                for (Direction direction : Direction.values()) {
+                    BlockPos neighbor = current.offset(direction);
+                    long packed = neighbor.asLong();
+                    if (nearbyAir.contains(packed)
+                            && !expandedEnvelope.contains(packed)
+                            && exteriorCore.add(packed)) {
+                        open.addLast(neighbor);
+                    }
+                }
+            }
+
+            Set<Long> outdoor = new HashSet<>(exteriorCore);
+            Set<Long> frontier = new HashSet<>(exteriorCore);
+            for (int distance = 0; distance < EXTERIOR_SURFACE_REACH; distance++) {
+                Set<Long> next = new HashSet<>();
+                for (long packed : frontier) {
+                    BlockPos current = BlockPos.fromLong(packed);
+                    for (int dx = -1; dx <= 1; dx++) {
+                        for (int dy = -1; dy <= 1; dy++) {
+                            for (int dz = -1; dz <= 1; dz++) {
+                                if (dx == 0 && dy == 0 && dz == 0) continue;
+                                long neighborPacked = current.add(dx, dy, dz).asLong();
+                                if (nearbyAir.contains(neighborPacked)
+                                        && outdoor.add(neighborPacked)) {
+                                    next.add(neighborPacked);
+                                }
+                            }
+                        }
+                    }
+                }
+                frontier = next;
+                if (frontier.isEmpty()) break;
             }
             return new OutdoorAirIndex(
-                    occupied, highestYByXZ, xExtentByYZ, zExtentByXY);
+                    occupied, outdoor, bounds,
+                    highestYByXZ, xExtentByYZ, zExtentByXY);
         }
 
         boolean isOutdoorAir(BlockPos pos) {
             if (occupied.contains(pos)) return false;
+            if (isOutsideBounds(pos, bounds) || outdoorAir.contains(pos.asLong())) return true;
+
             Integer highestY = highestYByXZ.get(pair(pos.getX(), pos.getZ()));
             if (highestY == null || pos.getY() > highestY) return true;
-
             Extent xExtent = xExtentByYZ.get(pair(pos.getY(), pos.getZ()));
-            if (xExtent == null || xExtent.isOutside(pos.getX())) return true;
-
+            if (hasShortClearRay(
+                    pos.getX(), xExtent, bounds.minX(), bounds.maxX())) return true;
             Extent zExtent = zExtentByXY.get(pair(pos.getX(), pos.getY()));
-            return zExtent == null || zExtent.isOutside(pos.getZ());
+            return hasShortClearRay(
+                    pos.getZ(), zExtent, bounds.minZ(), bounds.maxZ());
         }
 
         Set<Direction> horizontalFaces(BlockPos pos) {
@@ -927,8 +1270,41 @@ public final class ArchitecturalPlanner {
             return result;
         }
 
+        private static boolean isOutsideBounds(BlockPos pos, Bounds bounds) {
+            return pos.getX() < bounds.minX() || pos.getX() > bounds.maxX()
+                    || pos.getY() < bounds.minY() || pos.getY() > bounds.maxY()
+                    || pos.getZ() < bounds.minZ() || pos.getZ() > bounds.maxZ();
+        }
+
+        private static boolean touchesBounds(BlockPos pos, Bounds bounds) {
+            return pos.getX() <= bounds.minX() || pos.getX() >= bounds.maxX()
+                    || pos.getY() <= bounds.minY() || pos.getY() >= bounds.maxY()
+                    || pos.getZ() <= bounds.minZ() || pos.getZ() >= bounds.maxZ();
+        }
+
         private static long pair(int first, int second) {
             return ((long) first << 32) ^ (second & 0xffffffffL);
+        }
+
+        private static boolean hasShortClearRay(
+                int coordinate,
+                Extent occupiedExtent,
+                int minBound,
+                int maxBound
+        ) {
+            if (occupiedExtent == null) {
+                int distance = Math.min(
+                        coordinate - minBound + 1,
+                        maxBound - coordinate + 1);
+                return distance <= MAX_DIRECT_EXTERIOR_DEPTH;
+            }
+            if (coordinate < occupiedExtent.min()) {
+                return coordinate - minBound + 1 <= MAX_DIRECT_EXTERIOR_DEPTH;
+            }
+            if (coordinate > occupiedExtent.max()) {
+                return maxBound - coordinate + 1 <= MAX_DIRECT_EXTERIOR_DEPTH;
+            }
+            return false;
         }
 
         private record Extent(int min, int max) {
@@ -938,9 +1314,6 @@ public final class ArchitecturalPlanner {
                         Math.max(first.max, second.max));
             }
 
-            boolean isOutside(int value) {
-                return value < min || value > max;
-            }
         }
     }
 }

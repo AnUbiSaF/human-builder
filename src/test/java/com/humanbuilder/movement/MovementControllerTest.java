@@ -10,8 +10,8 @@ class MovementControllerTest {
 
     @Test
     void finalFlightEndpointRequiresPreciseVerticalAlignment() {
-        assertTrue(MovementController.isWithinPreciseFlightEndpoint(0.05, 0.04));
-        assertFalse(MovementController.isWithinPreciseFlightEndpoint(0.05, 0.081));
+        assertTrue(MovementController.isWithinPreciseFlightEndpoint(0.05, 0.119));
+        assertFalse(MovementController.isWithinPreciseFlightEndpoint(0.05, 0.12));
         assertFalse(MovementController.isWithinPreciseFlightEndpoint(0.05, 0.95));
     }
 

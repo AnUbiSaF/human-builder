@@ -29,15 +29,29 @@ public final class TemporarySupportPathfinder {
             int maxLength,
             int maxVisitedNodes
     ) {
+        return find(
+                target, SEARCH_DIRECTIONS, isAvailable, hasPermanentSupport,
+                maxLength, maxVisitedNodes);
+    }
+
+    public static List<BlockPos> find(
+            BlockPos target,
+            Direction[] targetSupportDirections,
+            Predicate<BlockPos> isAvailable,
+            Predicate<BlockPos> hasPermanentSupport,
+            int maxLength,
+            int maxVisitedNodes
+    ) {
         List<BlockPos> vertical = findVerticalColumn(
-                target, isAvailable, hasPermanentSupport, maxLength);
+                target, targetSupportDirections,
+                isAvailable, hasPermanentSupport, maxLength);
         if (!vertical.isEmpty()) return vertical;
 
         ArrayDeque<BlockPos> open = new ArrayDeque<>();
         Map<BlockPos, BlockPos> towardTarget = new HashMap<>();
         Set<BlockPos> visited = new HashSet<>();
 
-        for (Direction direction : SEARCH_DIRECTIONS) {
+        for (Direction direction : targetSupportDirections) {
             BlockPos start = target.offset(direction).toImmutable();
             if (isAvailable.test(start) && visited.add(start)) {
                 open.addLast(start);
@@ -76,11 +90,12 @@ public final class TemporarySupportPathfinder {
 
     private static List<BlockPos> findVerticalColumn(
             BlockPos target,
+            Direction[] targetSupportDirections,
             Predicate<BlockPos> isAvailable,
             Predicate<BlockPos> hasPermanentSupport,
             int maxLength
     ) {
-        for (Direction direction : SEARCH_DIRECTIONS) {
+        for (Direction direction : targetSupportDirections) {
             BlockPos cursor = target.offset(direction).toImmutable();
             List<BlockPos> fromTarget = new ArrayList<>();
             for (int length = 0; length < maxLength; length++) {

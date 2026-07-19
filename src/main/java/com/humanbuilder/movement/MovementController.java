@@ -35,7 +35,7 @@ public class MovementController {
     private static final double WAYPOINT_DISTANCE = 0.32;
     private static final double FINAL_DISTANCE = 0.20;
     private static final double FLIGHT_FINAL_HORIZONTAL_DISTANCE = 0.12;
-    private static final double FLIGHT_FINAL_VERTICAL_DISTANCE = 0.08;
+    private static final double FLIGHT_FINAL_VERTICAL_DISTANCE = 0.12;
     private static final double FLIGHT_ENDPOINT_CAPTURE_DISTANCE = 0.30;
     private static final double FLIGHT_ENDPOINT_MAX_VERTICAL_SPEED = 0.14;
     private static final double BUILD_CLEARANCE_MARGIN = 0.08;
@@ -44,7 +44,6 @@ public class MovementController {
     private static final int MAX_GROUND_NODES = 5_000;
     private static final int MAX_FLIGHT_NODES = 7_000;
     private static final int REPLAN_AFTER_TICKS = 12;
-    private static final int ENDPOINT_REPLAN_TICKS = 16;
     private static final double PROGRESS_EPSILON = 0.001;
     private static final int[][] HORIZONTAL_DIRECTIONS = {
             { 1, 0}, {-1, 0}, {0,  1}, {0, -1},
@@ -63,7 +62,6 @@ public class MovementController {
     private boolean active;
     private boolean flyingRoute;
     private int noProgressTicks;
-    private int blockedEndpointTicks;
     private int planningAttempts;
     private int noProgressReplans;
     private final Set<BlockPos> attemptedStandingPositions = new HashSet<>();
@@ -170,7 +168,6 @@ public class MovementController {
                     planningHoldTicks = 0;
                     bestWaypointDistance = Double.MAX_VALUE;
                     noProgressTicks = 0;
-                    blockedEndpointTicks = 0;
                     routeFailed = false;
                     routeArrived = false;
                     return true;
@@ -194,7 +191,6 @@ public class MovementController {
             return false;
         }
         noProgressTicks = 0;
-        blockedEndpointTicks = 0;
         scheduleRoutePlanning(cinematicMode && canUseCreativeFlight() ? 0 : 1);
         return true;
     }
@@ -250,19 +246,6 @@ public class MovementController {
             return;
         }
         advanceReachedWaypoints(player.getPos());
-
-        if (isBlockedAtFinalApproach(player.getPos())) {
-            blockedEndpointTicks++;
-            if (blockedEndpointTicks >= ENDPOINT_REPLAN_TICKS) {
-                HumanBuilderMod.LOGGER.info(
-                        "[HumanBuilder] Final approach to {} lost its interaction face; replanning",
-                        targetBlockPos.toShortString());
-                handleNoProgress();
-                return;
-            }
-        } else {
-            blockedEndpointTicks = 0;
-        }
 
         if (isAtDestination()) {
             routeArrived = true;
@@ -444,9 +427,6 @@ public class MovementController {
                     ? isWithinPreciseFlightEndpoint(horizontal, vertical)
                     : horizontal <= threshold && vertical <= verticalThreshold;
             if (!passedFlightWaypoint && !reachedWaypoint) break;
-            if (finalWaypoint
-                    && targetBlockPos != null
-                    && !canInteractFromCurrentPosition()) break;
 
             waypointIndex++;
             bestWaypointDistance = Double.MAX_VALUE;
@@ -516,10 +496,7 @@ public class MovementController {
         boolean arrived = flyingRoute
                 ? isWithinPreciseFlightEndpoint(horizontal, vertical)
                 : horizontal < FINAL_DISTANCE && vertical < 1.15;
-        if (!arrived) return false;
-        if (targetBlockPos == null) return true;
-
-        return canInteractFromCurrentPosition();
+        return arrived;
     }
 
     /** Stops current input but preserves flight between nearby build targets. */
@@ -530,7 +507,6 @@ public class MovementController {
         waypoints.clear();
         waypointIndex = 0;
         noProgressTicks = 0;
-        blockedEndpointTicks = 0;
         bestWaypointDistance = Double.MAX_VALUE;
         releaseAllKeys();
         settlePlayerMotion();
@@ -645,7 +621,6 @@ public class MovementController {
         waypointIndex = 0;
         bestWaypointDistance = Double.MAX_VALUE;
         noProgressTicks = 0;
-        blockedEndpointTicks = 0;
         planningAttempts = 0;
     }
 
@@ -972,7 +947,6 @@ public class MovementController {
         standingTarget = alternative;
         bestWaypointDistance = Double.MAX_VALUE;
         noProgressTicks = 0;
-        blockedEndpointTicks = 0;
         return true;
     }
 
@@ -1059,18 +1033,6 @@ public class MovementController {
                 deltaY,
                 -FLIGHT_ENDPOINT_MAX_VERTICAL_SPEED,
                 FLIGHT_ENDPOINT_MAX_VERTICAL_SPEED);
-    }
-
-    private boolean isBlockedAtFinalApproach(Vec3d playerPos) {
-        if (targetBlockPos == null || standingTarget == null || waypoints.isEmpty()
-                || waypointIndex != waypoints.size() - 1) return false;
-        double horizontal = Math.hypot(standingTarget.x - playerPos.x, standingTarget.z - playerPos.z);
-        double vertical = Math.abs(standingTarget.y - playerPos.y);
-        Vec3d velocity = client.player.getVelocity();
-        boolean settled = Math.hypot(velocity.x, velocity.z) < 0.015
-                && Math.abs(velocity.y) < 0.015;
-        return horizontal < 0.025 && vertical < 0.035 && settled
-                && !canInteractFromCurrentPosition();
     }
 
     private void scheduleRoutePlanning(int holdTicks) {

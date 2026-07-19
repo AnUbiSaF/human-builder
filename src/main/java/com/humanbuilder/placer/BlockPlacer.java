@@ -1,11 +1,22 @@
 package com.humanbuilder.placer;
 
 import com.humanbuilder.HumanBuilderMod;
+import net.minecraft.block.AmethystClusterBlock;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.EndRodBlock;
 import net.minecraft.block.FallingBlock;
+import net.minecraft.block.LadderBlock;
+import net.minecraft.block.RodBlock;
+import net.minecraft.block.SkullBlock;
 import net.minecraft.block.SlabBlock;
 import net.minecraft.block.StairsBlock;
+import net.minecraft.block.WallBannerBlock;
+import net.minecraft.block.WallMountedBlock;
+import net.minecraft.block.WallSignBlock;
+import net.minecraft.block.WallSkullBlock;
+import net.minecraft.block.WallTorchBlock;
+import net.minecraft.block.enums.BlockFace;
 import net.minecraft.block.enums.BlockHalf;
 import net.minecraft.block.enums.SlabType;
 import net.minecraft.client.MinecraftClient;
@@ -23,6 +34,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.RotationPropertyHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.shape.VoxelShape;
 import net.minecraft.world.RaycastContext;
@@ -62,42 +74,33 @@ public class BlockPlacer {
     private boolean lineOfSightRequired = false;
 
     private Direction[] getFacePriority(BlockState state) {
+        if (state != null && state.getBlock() instanceof SlabBlock) {
+            return slabSupportDirections(state.get(Properties.SLAB_TYPE));
+        }
+
+        if (isWallMounted(state)) {
+            return new Direction[] {wallMountedSupportDirection(
+                    state.get(Properties.BLOCK_FACE),
+                    state.get(Properties.HORIZONTAL_FACING))};
+        }
+
         if (state != null && state.contains(Properties.AXIS)) {
-            Direction.Axis axis = state.get(Properties.AXIS);
-            if (axis == Direction.Axis.Y) {
-                return new Direction[] {
-                        Direction.DOWN,   // блок снизу (ставим сверху на него)
-                        Direction.UP,     // блок сверху (ставим снизу — редко)
-                        Direction.NORTH,
-                        Direction.SOUTH,
-                        Direction.EAST,
-                        Direction.WEST
-                };
-            } else if (axis == Direction.Axis.X) {
-                return new Direction[] {
-                        Direction.WEST,   // опора с запада (клик по восточной грани)
-                        Direction.EAST,   // опора с востока (клик по западной грани)
-                        Direction.NORTH,
-                        Direction.SOUTH,
-                        Direction.DOWN,
-                        Direction.UP
-                };
-            } else if (axis == Direction.Axis.Z) {
-                return new Direction[] {
-                        Direction.NORTH,  // опора с севера (клик по южной грани)
-                        Direction.SOUTH,  // опора с юга (клик по северной грани)
-                        Direction.WEST,
-                        Direction.EAST,
-                        Direction.DOWN,
-                        Direction.UP
-                };
+            return axisSupportDirections(state.get(Properties.AXIS));
+        }
+
+        Direction clickedFace = desiredClickedFace(state);
+        if (clickedFace != null) {
+            Direction primarySupport = faceDirectedSupportDirection(clickedFace);
+            if (state.getBlock() instanceof EndRodBlock) {
+                return new Direction[] {primarySupport, primarySupport.getOpposite()};
             }
+            return new Direction[] {primarySupport};
         }
 
         if (state != null && state.getBlock() instanceof net.minecraft.block.TrapdoorBlock) {
             Direction facing = state.get(Properties.HORIZONTAL_FACING);
             return new Direction[] {
-                    facing, // Опора со стороны петель
+                    trapdoorSupportDirection(facing),
                     Direction.DOWN,
                     Direction.UP
             };
@@ -112,6 +115,77 @@ public class BlockPlacer {
                 Direction.DOWN,   // блок снизу (ставим сверху на него)
                 Direction.UP      // блок сверху (ставим снизу — редко)
         };
+    }
+
+    public Direction[] getPlacementSupportDirections(BlockState state) {
+        if (state != null && state.getBlock() instanceof SlabBlock) {
+            return slabSupportDirections(state.get(Properties.SLAB_TYPE));
+        }
+        if (isWallMounted(state)) {
+            return new Direction[] {wallMountedSupportDirection(
+                    state.get(Properties.BLOCK_FACE),
+                    state.get(Properties.HORIZONTAL_FACING))};
+        }
+        Direction clickedFace = desiredClickedFace(state);
+        if (clickedFace != null) {
+            return new Direction[] {faceDirectedSupportDirection(clickedFace)};
+        }
+        return getFacePriority(state).clone();
+    }
+
+    static Direction[] axisSupportDirections(Direction.Axis axis) {
+        return switch (axis) {
+            case X -> new Direction[] {Direction.WEST, Direction.EAST};
+            case Y -> new Direction[] {Direction.DOWN, Direction.UP};
+            case Z -> new Direction[] {Direction.NORTH, Direction.SOUTH};
+        };
+    }
+
+    static Direction trapdoorSupportDirection(Direction desiredFacing) {
+        // TrapdoorBlock copies the clicked horizontal face into FACING. The
+        // support lies on the opposite side of that face.
+        return desiredFacing.getOpposite();
+    }
+
+    static Direction faceDirectedSupportDirection(Direction desiredFacing) {
+        return desiredFacing.getOpposite();
+    }
+
+    static Direction[] slabSupportDirections(SlabType type) {
+        Direction[] horizontal = {
+                Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST
+        };
+        if (type == SlabType.DOUBLE) {
+            return new Direction[] {
+                    Direction.NORTH, Direction.SOUTH, Direction.EAST,
+                    Direction.WEST, Direction.DOWN, Direction.UP
+            };
+        }
+        Direction vertical = type == SlabType.TOP ? Direction.UP : Direction.DOWN;
+        return new Direction[] {
+                vertical, horizontal[0], horizontal[1], horizontal[2], horizontal[3]
+        };
+    }
+
+    static Direction wallMountedSupportDirection(
+            BlockFace face,
+            Direction desiredFacing
+    ) {
+        return switch (face) {
+            case FLOOR -> Direction.DOWN;
+            case CEILING -> Direction.UP;
+            case WALL -> desiredFacing.getOpposite();
+        };
+    }
+
+    static Direction endRodFacingAfterClick(
+            Direction clickedFace,
+            boolean supportIsEndRod,
+            Direction supportFacing
+    ) {
+        return supportIsEndRod && supportFacing == clickedFace
+                ? clickedFace.getOpposite()
+                : clickedFace;
     }
 
     /** Слот хотбара для creative-fill (последний слот) */
@@ -210,7 +284,10 @@ public class BlockPlacer {
         // For StairsBlock, facing ALWAYS depends on player yaw (getPlayerFacing().getOpposite())!
         // For other directional blocks (like trapdoors), player yaw clamp is only used when clicking top/bottom faces.
         if (requiresPlacementFacing(state)) {
-            if (state.getBlock() instanceof StairsBlock || hitResult.getSide().getAxis().isVertical()) {
+            if (state.contains(Properties.ROTATION)) {
+                targetYaw = getPlacementYaw(state);
+            } else if (state.getBlock() instanceof StairsBlock
+                    || hitResult.getSide().getAxis().isVertical()) {
                 float desiredYaw = getPlacementYaw(state);
                 float diff = MathHelper.wrapDegrees(targetYaw - desiredYaw);
                 diff = MathHelper.clamp(diff, -44.0f, 44.0f);
@@ -533,14 +610,25 @@ public class BlockPlacer {
     }
 
     public boolean requiresPlacementFacing(BlockState state) {
-        return state.contains(Properties.HORIZONTAL_FACING);
+        return state.contains(Properties.HORIZONTAL_FACING)
+                || state.contains(Properties.ROTATION);
     }
 
     public float getPlacementYaw(BlockState state) {
+        if (state.contains(Properties.ROTATION)) {
+            float placementOffset = state.getBlock() instanceof SkullBlock ? 0.0f : 180.0f;
+            return rotationPlacementYaw(
+                    state.get(Properties.ROTATION), placementOffset);
+        }
         if (state.getBlock() instanceof net.minecraft.block.TrapdoorBlock && state.contains(Properties.HORIZONTAL_FACING)) {
             return state.get(Properties.HORIZONTAL_FACING).getOpposite().getPositiveHorizontalDegrees();
         }
         return state.get(Properties.HORIZONTAL_FACING).getPositiveHorizontalDegrees();
+    }
+
+    static float rotationPlacementYaw(int rotation, float placementOffset) {
+        return MathHelper.wrapDegrees(
+                RotationPropertyHelper.toDegrees(rotation) - placementOffset);
     }
 
     /** Keeps cinematic tools from rotating the camera just to orient stairs. */
@@ -806,10 +894,12 @@ public class BlockPlacer {
 
             // Проверяем, что опорный блок реально может принять клик.
             if (!isSolid && !isRecentlyPlaced) continue;
+            if (state.getBlock() instanceof EndRodBlock && !isSolid) continue;
 
             // Грань опорного блока, на которую кликаем:
             // это грань, смотрящая ОТ опорного блока К целевому
             Direction clickFace = dir.getOpposite();
+            if (!producesDesiredClickedFacing(state, supportState, clickFace)) continue;
 
             VoxelShape shape = supportState.getOutlineShape(client.world, supportPos);
             List<Box> boxes = shape.isEmpty() ? List.of(new Box(0, 0, 0, 1, 1, 1)) : shape.getBoundingBoxes();
@@ -837,7 +927,9 @@ public class BlockPlacer {
                 if (result.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
                         && result.getBlockPos().equals(supportPos)
                         && result.getSide() == clickFace) {
-                    return new BlockHitResult(result.getPos(), clickFace, supportPos, false);
+                    // Keep the deliberate 0.25/0.75 hit height. The raycast
+                    // intersection may drift across SlabBlock's 0.5 threshold.
+                    return new BlockHitResult(hitVec, clickFace, supportPos, false);
                 }
                 if (result.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
                         && !result.getBlockPos().equals(supportPos)
@@ -855,6 +947,57 @@ public class BlockPlacer {
             return null;
         }
         return fallback; // Нет подходящей опоры
+    }
+
+    private Direction desiredClickedFace(BlockState state) {
+        if (state == null) return null;
+        net.minecraft.block.Block block = state.getBlock();
+        if ((block instanceof RodBlock || block instanceof AmethystClusterBlock)
+                && state.contains(Properties.FACING)) {
+            return state.get(Properties.FACING);
+        }
+        if ((block instanceof WallTorchBlock
+                || block instanceof LadderBlock
+                || block instanceof WallSignBlock
+                || block instanceof WallBannerBlock
+                || block instanceof WallSkullBlock)
+                && state.contains(Properties.HORIZONTAL_FACING)) {
+            return state.get(Properties.HORIZONTAL_FACING);
+        }
+        return null;
+    }
+
+    private boolean producesDesiredClickedFacing(
+            BlockState desired,
+            BlockState support,
+            Direction clickedFace
+    ) {
+        if (isWallMounted(desired)) {
+            Direction supportDirection = wallMountedSupportDirection(
+                    desired.get(Properties.BLOCK_FACE),
+                    desired.get(Properties.HORIZONTAL_FACING));
+            return clickedFace == supportDirection.getOpposite();
+        }
+
+        Direction desiredFacing = desiredClickedFace(desired);
+        if (desiredFacing == null) return true;
+
+        Direction produced = clickedFace;
+        if (desired.getBlock() instanceof EndRodBlock) {
+            boolean supportIsEndRod = support.getBlock() instanceof EndRodBlock;
+            Direction supportFacing = supportIsEndRod && support.contains(Properties.FACING)
+                    ? support.get(Properties.FACING) : null;
+            produced = endRodFacingAfterClick(
+                    clickedFace, supportIsEndRod, supportFacing);
+        }
+        return produced == desiredFacing;
+    }
+
+    private boolean isWallMounted(BlockState state) {
+        return state != null
+                && state.getBlock() instanceof WallMountedBlock
+                && state.contains(Properties.BLOCK_FACE)
+                && state.contains(Properties.HORIZONTAL_FACING);
     }
 
     private Vec3d faceCenter(BlockPos pos, Box box, Direction face) {
@@ -937,6 +1080,11 @@ public class BlockPlacer {
                     eyePos, rayEnd, RaycastContext.ShapeType.OUTLINE,
                     RaycastContext.FluidHandling.NONE, client.player
             ));
+            if (result.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
+                    && result.getBlockPos().equals(targetPos)
+                    && result.getSide() == clickFace) {
+                return new BlockHitResult(hit, clickFace, targetPos, false);
+            }
         }
         return null;
     }
